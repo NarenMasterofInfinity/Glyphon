@@ -30,7 +30,8 @@ from correction import (
     split_column_by_delimiter,
     split_row_by_delimiter,
 )
-from parser import build_table_records, parse_pdf_pages, render_page_image
+from parser import CellExtraction, PageExtractionResult, build_table_records, parse_pdf_pages, render_page_image
+from scanned_parser import extract_table_scanned
 
 
 st.set_page_config(page_title="Glyphon Table Fixer", layout="wide")
@@ -842,6 +843,219 @@ VISUAL_WORKSPACE = st.components.v2.component(
     js=VISUAL_WORKSPACE_JS,
 )
 
+POLYGON_SELECTOR_HTML = """
+<div id="polygon-root" class="polygon-shell">
+  <div class="polygon-toolbar">
+    <button id="clear-polygon" type="button">Clear</button>
+    <button id="submit-polygon" type="button" disabled>Extract selected table</button>
+  </div>
+  <div class="polygon-page">
+    <img id="polygon-image" />
+    <svg id="polygon-svg"></svg>
+  </div>
+</div>
+"""
+
+POLYGON_SELECTOR_CSS = """
+.polygon-shell {
+  height: 760px;
+  overflow: auto;
+  border: 1px solid #d7dce2;
+  border-radius: 6px;
+  background: #fff;
+  font-family: "Aptos", "Segoe UI", sans-serif;
+}
+.polygon-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 4;
+  display: flex;
+  gap: 8px;
+  padding: 8px 10px;
+  border-bottom: 1px solid #d7dce2;
+  background: #f8fafc;
+}
+.polygon-toolbar button {
+  border: 1px solid #b9c3d0;
+  border-radius: 4px;
+  background: #fff;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+.polygon-toolbar button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+#submit-polygon {
+  border-color: #174ea6;
+  background: #174ea6;
+  color: #fff;
+}
+.polygon-page {
+  position: relative;
+  width: max-content;
+  max-width: 100%;
+  margin: 0 auto;
+}
+#polygon-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+#polygon-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+.source-box {
+  fill: transparent;
+  stroke: rgba(31, 99, 199, 0.78);
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+.source-box.inside {
+  fill: rgba(0, 184, 107, 0.18);
+  stroke: rgba(0, 130, 75, 1);
+}
+.selection-polygon {
+  fill: rgba(213, 72, 33, 0.12);
+  stroke: rgba(213, 72, 33, 0.95);
+  stroke-width: 2.5;
+  vector-effect: non-scaling-stroke;
+}
+.selection-line {
+  fill: none;
+  stroke: rgba(213, 72, 33, 0.95);
+  stroke-width: 2;
+  stroke-dasharray: 6 4;
+  vector-effect: non-scaling-stroke;
+}
+.polygon-point {
+  fill: #fff;
+  stroke: #d54821;
+  stroke-width: 2.5;
+  cursor: grab;
+  vector-effect: non-scaling-stroke;
+}
+.polygon-point:active {
+  cursor: grabbing;
+}
+"""
+
+POLYGON_SELECTOR_JS = """
+export default function(component) {
+  const { data, parentElement, setTriggerValue } = component;
+  const root = parentElement.querySelector("#polygon-root");
+  if (!root || !data) return;
+
+  const image = root.querySelector("#polygon-image");
+  const svg = root.querySelector("#polygon-svg");
+  const clearButton = root.querySelector("#clear-polygon");
+  const submitButton = root.querySelector("#submit-polygon");
+  let points = [];
+  let draggingIndex = null;
+
+  image.src = data.image;
+
+  function toSvgPoint(event) {
+    const rect = image.getBoundingClientRect();
+    return {
+      x: Math.max(0, Math.min(data.pageWidth, ((event.clientX - rect.left) / rect.width) * data.pageWidth)),
+      y: Math.max(0, Math.min(data.pageHeight, ((event.clientY - rect.top) / rect.height) * data.pageHeight)),
+    };
+  }
+
+  function pointInPolygon(point, polygon) {
+    let inside = false;
+    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+      const xi = polygon[i].x, yi = polygon[i].y;
+      const xj = polygon[j].x, yj = polygon[j].y;
+      const intersects = ((yi > point.y) !== (yj > point.y)) &&
+        (point.x < ((xj - xi) * (point.y - yi)) / (yj - yi + Number.EPSILON) + xi);
+      if (intersects) inside = !inside;
+    }
+    return inside;
+  }
+
+  function render() {
+    svg.setAttribute("viewBox", `0 0 ${data.pageWidth} ${data.pageHeight}`);
+    svg.innerHTML = "";
+
+    for (const item of data.items || []) {
+      const rect = document.createElementNS("http://www.w3.org/2000/svg", "rect");
+      rect.setAttribute("x", item.x0);
+      rect.setAttribute("y", item.y0);
+      rect.setAttribute("width", item.x1 - item.x0);
+      rect.setAttribute("height", item.y1 - item.y0);
+      rect.setAttribute("class", "source-box");
+      if (points.length >= 3 && pointInPolygon({ x: (item.x0 + item.x1) / 2, y: (item.y0 + item.y1) / 2 }, points)) {
+        rect.classList.add("inside");
+      }
+      svg.appendChild(rect);
+    }
+
+    if (points.length >= 2) {
+      const path = document.createElementNS("http://www.w3.org/2000/svg", points.length >= 3 ? "polygon" : "polyline");
+      path.setAttribute("points", points.map((point) => `${point.x},${point.y}`).join(" "));
+      path.setAttribute("class", points.length >= 3 ? "selection-polygon" : "selection-line");
+      svg.appendChild(path);
+    }
+
+    points.forEach((point, index) => {
+      const circle = document.createElementNS("http://www.w3.org/2000/svg", "circle");
+      circle.setAttribute("cx", point.x);
+      circle.setAttribute("cy", point.y);
+      circle.setAttribute("r", 6);
+      circle.setAttribute("class", "polygon-point");
+      circle.onpointerdown = (event) => {
+        draggingIndex = index;
+        circle.setPointerCapture(event.pointerId);
+        event.stopPropagation();
+      };
+      circle.onpointermove = (event) => {
+        if (draggingIndex !== index) return;
+        points[index] = toSvgPoint(event);
+        render();
+        event.stopPropagation();
+      };
+      circle.onpointerup = (event) => {
+        draggingIndex = null;
+        circle.releasePointerCapture(event.pointerId);
+        event.stopPropagation();
+      };
+      svg.appendChild(circle);
+    });
+
+    submitButton.disabled = points.length < 3;
+  }
+
+  svg.onclick = (event) => {
+    if (event.target.classList.contains("polygon-point")) return;
+    points.push(toSvgPoint(event));
+    render();
+  };
+  clearButton.onclick = () => {
+    points = [];
+    render();
+  };
+  submitButton.onclick = () => {
+    if (points.length < 3) return;
+    setTriggerValue("polygon", { points });
+  };
+
+  render();
+}
+"""
+
+POLYGON_SELECTOR = st.components.v2.component(
+    "glyphon_polygon_selector",
+    html=POLYGON_SELECTOR_HTML,
+    css=POLYGON_SELECTOR_CSS,
+    js=POLYGON_SELECTOR_JS,
+)
+
 
 @st.cache_data(show_spinner=False)
 def run_parser(pdf_bytes: bytes, cache_version: str):
@@ -868,6 +1082,20 @@ def initialize_state(file_key: str, initial_df: pd.DataFrame, page_results) -> N
     st.session_state.history = []
     st.session_state.redo_stack = []
     st.session_state.operation_history = []
+    st.session_state.pending_change = None
+    st.session_state.page_results = page_results
+
+
+def initialize_selective_state(file_key: str, initial_df: pd.DataFrame, page_results, operation: dict[str, Any]) -> None:
+    if st.session_state.get("file_key") == file_key:
+        return
+
+    st.session_state.file_key = file_key
+    st.session_state.original_df = clone_df(initial_df)
+    st.session_state.corrected_df = clone_df(initial_df)
+    st.session_state.history = []
+    st.session_state.redo_stack = []
+    st.session_state.operation_history = [operation]
     st.session_state.pending_change = None
     st.session_state.page_results = page_results
 
@@ -1010,6 +1238,87 @@ def visual_workspace_payload(
     }
 
 
+def polygon_selector_payload(
+    pdf_bytes: bytes,
+    page_number: int,
+    zoom: float,
+    page_result,
+) -> dict[str, Any]:
+    page_image = render_page_image(pdf_bytes, page_number, zoom=zoom)
+    return {
+        "image": image_to_data_uri(page_image),
+        "pageWidth": page_result.page_width,
+        "pageHeight": page_result.page_height,
+        "items": [
+            {
+                "index": index,
+                "text": item.text,
+                "x0": item.x0,
+                "y0": item.y0,
+                "x1": item.x1,
+                "y1": item.y1,
+            }
+            for index, item in enumerate(page_result.raw_items)
+        ],
+    }
+
+
+def point_in_polygon(x: float, y: float, polygon: list[dict[str, float]]) -> bool:
+    inside = False
+    j = len(polygon) - 1
+    for i, point in enumerate(polygon):
+        xi = float(point["x"])
+        yi = float(point["y"])
+        xj = float(polygon[j]["x"])
+        yj = float(polygon[j]["y"])
+        intersects = ((yi > y) != (yj > y)) and (
+            x < ((xj - xi) * (y - yi)) / ((yj - yi) or 1e-9) + xi
+        )
+        if intersects:
+            inside = not inside
+        j = i
+    return inside
+
+
+def build_selective_page_result(page_result, polygon: list[dict[str, float]]) -> PageExtractionResult:
+    selected_items = [
+        item
+        for item in page_result.raw_items
+        if point_in_polygon(item.cx, item.cy, polygon)
+    ]
+    extracted = extract_table_scanned(selected_items, page_result.page_width)
+    return PageExtractionResult(
+        page_number=page_result.page_number,
+        page_width=page_result.page_width,
+        page_height=page_result.page_height,
+        column_names=extracted["column_names"],
+        rows=extracted["aligned_rows"],
+        raw_items=selected_items,
+        slant_angle=extracted["slant_angle"],
+        column_centers=extracted["column_centers"],
+        table_band=extracted["band"],
+        cells=[
+            CellExtraction(page_number=page_result.page_number, **cell)
+            for cell in extracted["cells"]
+        ],
+    )
+
+
+def load_selective_extraction(file_key: str, selective_result: PageExtractionResult) -> None:
+    st.session_state.selective_override = {
+        "file_key": file_key,
+        "page_results": [selective_result],
+        "state_key": f"{file_key}:selective:{selective_result.page_number}",
+        "operation": operation_record(
+            "selective_extraction",
+            {
+                "page_number": selective_result.page_number,
+                "source_item_count": len(selective_result.raw_items),
+            },
+        ),
+    }
+
+
 def handle_visual_merge_event(event: dict[str, Any] | None, corrected_df: pd.DataFrame, selected_page: int) -> None:
     if not event or st.session_state.pending_change is not None:
         return
@@ -1023,6 +1332,22 @@ def handle_visual_merge_event(event: dict[str, Any] | None, corrected_df: pd.Dat
             f"Merge columns {columns} into {output_name}.",
             preview_df,
             {"columns": columns, "output_name": output_name, "source": "visual_workspace"},
+        )
+        st.rerun()
+
+    if event.get("kind") == "merge_rows":
+        row_numbers = event.get("rowNumbers") or []
+        page_indexes = corrected_df.index[corrected_df["page_number"] == selected_page].tolist()
+        row_labels = {
+            int(corrected_df.at[index, "row_number"]): index
+            for index in page_indexes
+        }
+        preview_df = merge_rows(corrected_df, [row_labels[row_number] for row_number in row_numbers])
+        set_pending(
+            "merge_rows",
+            f"Merge rows {row_numbers} on page {selected_page}.",
+            preview_df,
+            {"page_number": selected_page, "rows": row_numbers, "source": "visual_workspace"},
         )
         st.rerun()
 
@@ -1092,23 +1417,6 @@ def handle_visual_split_event(
             },
         )
         st.rerun()
-
-    if event.get("kind") == "merge_rows":
-        row_numbers = event.get("rowNumbers") or []
-        page_indexes = corrected_df.index[corrected_df["page_number"] == selected_page].tolist()
-        row_labels = {
-            int(corrected_df.at[index, "row_number"]): index
-            for index in page_indexes
-        }
-        preview_df = merge_rows(corrected_df, [row_labels[row_number] for row_number in row_numbers])
-        set_pending(
-            "merge_rows",
-            f"Merge rows {row_numbers} on page {selected_page}.",
-            preview_df,
-            {"page_number": selected_page, "rows": row_numbers, "source": "visual_workspace"},
-        )
-        st.rerun()
-
 
 def handle_visual_edit_event(
     event: dict[str, Any] | None,
@@ -1417,14 +1725,28 @@ def main() -> None:
 
     pdf_bytes = uploaded_file.read()
     file_key = get_file_key(pdf_bytes)
-    page_results = run_parser(pdf_bytes, PARSER_CACHE_VERSION)
+    base_page_results = run_parser(pdf_bytes, PARSER_CACHE_VERSION)
 
-    if not page_results:
+    if not base_page_results:
         st.warning("No pages were parsed.")
         return
 
-    initial_df = build_initial_table(page_results)
-    initialize_state(file_key, initial_df, page_results)
+    selective_override = st.session_state.get("selective_override")
+    if selective_override and selective_override.get("file_key") == file_key:
+        page_results = selective_override["page_results"]
+        active_state_key = selective_override["state_key"]
+        initial_df = build_initial_table(page_results)
+        initialize_selective_state(
+            active_state_key,
+            initial_df,
+            page_results,
+            selective_override["operation"],
+        )
+    else:
+        page_results = base_page_results
+        active_state_key = file_key
+        initial_df = build_initial_table(page_results)
+        initialize_state(active_state_key, initial_df, page_results)
 
     corrected_df = st.session_state.corrected_df
     page_numbers = [result.page_number for result in page_results]
@@ -1655,12 +1977,47 @@ def main() -> None:
         except Exception as exc:
             st.error(str(exc))
 
-    tabs = st.tabs(["Corrected Table", "Lineage", "Export"])
+    tabs = st.tabs(["Corrected Table", "Selective Extraction", "Lineage", "Export"])
 
     with tabs[0]:
         st.dataframe(st.session_state.corrected_df, use_container_width=True, height=420)
 
     with tabs[1]:
+        if selective_override and selective_override.get("file_key") == file_key:
+            st.caption("Selective extraction is active for this upload.")
+            if st.button("Return to full-page extraction", use_container_width=True):
+                st.session_state.selective_override = None
+                st.session_state.file_key = ""
+                st.rerun()
+
+        selective_page_number = st.selectbox(
+            "Page",
+            options=[result.page_number for result in base_page_results],
+            key="selective_page_number",
+        )
+        selective_page_result = next(
+            result for result in base_page_results if result.page_number == selective_page_number
+        )
+        polygon_result = POLYGON_SELECTOR(
+            key=f"polygon_selector_{file_key}_{selective_page_number}",
+            data=polygon_selector_payload(pdf_bytes, selective_page_number, zoom, selective_page_result),
+            height=780,
+            on_polygon_change=lambda: None,
+        )
+        polygon_event = getattr(polygon_result, "polygon", None)
+        if polygon_event:
+            polygon = polygon_event.get("points", [])
+            if len(polygon) < 3:
+                st.warning("Draw at least three polygon points around one table.")
+            else:
+                selective_result = build_selective_page_result(selective_page_result, polygon)
+                if not selective_result.raw_items:
+                    st.warning("No OCR boxes were found inside the selected polygon.")
+                else:
+                    load_selective_extraction(file_key, selective_result)
+                    st.rerun()
+
+    with tabs[2]:
         metadata = {
             "original_columns": st.session_state.original_df.columns.tolist(),
             "corrected_columns": st.session_state.corrected_df.columns.tolist(),
@@ -1671,7 +2028,7 @@ def main() -> None:
         }
         st.json(metadata)
 
-    with tabs[2]:
+    with tabs[3]:
         st.download_button(
             "Download corrected Excel",
             data=dataframe_to_excel(st.session_state.corrected_df),
