@@ -72,18 +72,28 @@ def _ocr_page(page: fitz.Page, page_number: int, ocr: RapidOCR, dpi: int) -> lis
     return items
 
 
-def parse_pdf_pages(pdf_bytes: bytes, dpi: int = 200) -> list[PageExtractionResult]:
+def parse_pdf_pages(
+    pdf_bytes: bytes,
+    dpi: int = 200,
+    page_numbers: list[int] | None = None,
+) -> list[PageExtractionResult]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     ocr = RapidOCR()
     results: list[PageExtractionResult] = []
 
-    for page_index in range(len(doc)):
+    if page_numbers:
+        target_pages = [page_number for page_number in page_numbers if 1 <= page_number <= len(doc)]
+    else:
+        target_pages = list(range(1, len(doc) + 1))
+
+    for page_number in target_pages:
+        page_index = page_number - 1
         page = doc[page_index]
-        raw_items = _ocr_page(page, page_index + 1, ocr, dpi)
+        raw_items = _ocr_page(page, page_number, ocr, dpi)
         extracted = extract_table_scanned(raw_items, page.rect.width)
         results.append(
             PageExtractionResult(
-                page_number=page_index + 1,
+                page_number=page_number,
                 page_width=page.rect.width,
                 page_height=page.rect.height,
                 column_names=extracted["column_names"],

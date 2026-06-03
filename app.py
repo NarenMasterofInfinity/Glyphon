@@ -6,6 +6,7 @@ from io import BytesIO
 from hashlib import sha256
 from typing import Any
 
+import fitz
 import pandas as pd
 import streamlit as st
 from PIL import ImageDraw
@@ -14,6 +15,7 @@ from correction import (
     PendingChange,
     clone_df,
     data_columns,
+    dataframe_to_csv,
     dataframe_to_excel,
     delete_columns,
     delete_rows,
@@ -100,7 +102,7 @@ VISUAL_WORKSPACE_HTML = """
       </div>
       <menu>
         <button id="split-cancel" type="button">Cancel</button>
-        <button type="submit">Submit split</button>
+        <button type="submit">Apply change</button>
       </menu>
     </form>
   </dialog>
@@ -178,6 +180,7 @@ VISUAL_WORKSPACE_CSS = """
 #overlay {
   position: absolute;
   inset: 0;
+  pointer-events: none;
 }
 .bbox {
   position: absolute;
@@ -353,7 +356,7 @@ td:hover .merge-row {
   border: 1px solid #ccd3dc;
   border-radius: 8px;
   padding: 16px;
-  width: min(520px, 92vw);
+  width: min(920px, 94vw);
 }
 #cell-dialog {
   border: 1px solid #ccd3dc;
@@ -390,6 +393,25 @@ td:hover .merge-row {
   padding: 8px;
   background: #fafbfc;
   font-size: 13px;
+}
+.split-preview-table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 8px;
+}
+.split-preview-table th,
+.split-preview-table td {
+  border: 1px solid #d8dee8;
+  padding: 6px 8px;
+  vertical-align: top;
+  text-align: left;
+}
+.split-preview-table th {
+  background: #eef2f7;
+  font-weight: 650;
+}
+.empty-preview {
+  color: #6b7280;
 }
 .split-names {
   display: grid;
@@ -466,6 +488,7 @@ export default function(component) {
   let pendingEdit = null;
   let guidePoints = [];
   let draggingPoint = null;
+  let drawingGuide = false;
   let moveSource = null;
 
   pageImage.src = data.image;
@@ -477,6 +500,8 @@ export default function(component) {
   submitGuide.disabled = true;
 
   const itemMap = new Map((data.items || []).map((item) => [item.index, item]));
+  const rowMap = new Map((data.rows || []).map((row) => [Number(row.row_number), row]));
+  const cellMap = new Map((data.cells || []).map((cell) => [`${cell.row}:${cell.col}`, cell]));
   const rowItems = new Map();
   const colItems = new Map();
   const cellItems = new Map();
@@ -588,7 +613,11 @@ export default function(component) {
 
   function renderDrawnGuide() {
     placeDot(pointA, guidePoints[0]);
-    if (guidePoints[1]) placeDot(pointB, guidePoints[1]);
+    if (guidePoints[1]) {
+      placeDot(pointB, guidePoints[1]);
+    } else {
+      pointB.style.display = "none";
+    }
     const value = guideValue();
     submitGuide.disabled = value === null;
     drawnGuide.className = "drawn-guide";
@@ -612,6 +641,7 @@ export default function(component) {
   function resetGuide() {
     guidePoints = [];
     draggingPoint = null;
+    drawingGuide = false;
     clearMoveSource();
     pointA.style.display = "none";
     pointB.style.display = "none";
@@ -630,6 +660,31 @@ export default function(component) {
       else after += 1;
     }
     return { before, after };
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#039;");
+  }
+
+  function partitionText(source, axis, value) {
+    const before = [];
+    const after = [];
+    for (const itemIndex of source || []) {
+      const item = itemMap.get(itemIndex);
+      if (!item) continue;
+      const itemValue = axis === "x" ? (item.x0 + item.x1) / 2 : (item.y0 + item.y1) / 2;
+      if (itemValue <= value) before.push(item.text);
+      else after.push(item.text);
+    }
+    return {
+      before: before.join(" ").trim(),
+      after: after.join(" ").trim(),
+    };
   }
 
   function affectedColumns(value) {
@@ -661,19 +716,92 @@ export default function(component) {
     if (guideMode.value === "vertical_split") {
       const columns = affectedColumns(value);
       splitTitle.textContent = "Preview column split";
-      splitPreview.innerHTML = columns.length
-        ? `<b>Columns crossing guide:</b><br>${columns.map((col) => `${col} -> ${col}_left + ${col}_right`).join("<br>")}`
-        : "No existing column has source boxes on both sides of this guide.";
+      if (columns.length) {
+        const columnIndexes = new Map(columns.map((column) => [data.columns.indexOf(column) + 1, column]));
+        const previewRows = [];
+        for (const cell of data.cells || []) {
+          const column = columnIndexes.get(cell.col);
+          if (!column) continue;
+          const split = itemPartition(cell.source, "x", value);
+          if (!(split.before > 0 && split.after > 0)) continue;
+          const parts = partitionText(cell.source, "x", value);
+          const sourceRow = rowMap.get(Number(cell.row)) || {};
+          previewRows.push(`
+            <tr>
+              <td>${escapeHtml(cell.row)}</td>
+              <td>${escapeHtml(column)}</td>
+              <td>${escapeHtml(sourceRow[column] ?? cell.text)}</td>
+              <td>${escapeHtml(parts.before)}</td>
+              <td>${escapeHtml(parts.after)}</td>
+            </tr>
+          `);
+        }
+        splitPreview.innerHTML = `
+          <div><b>${escapeHtml(columns.join(", "))}</b> will be split by the vertical guide.</div>
+          <table class="split-preview-table">
+            <thead>
+              <tr><th>Row</th><th>Column</th><th>Before</th><th>Left</th><th>Right</th></tr>
+            </thead>
+            <tbody>${previewRows.join("")}</tbody>
+          </table>
+        `;
+      } else {
+        splitPreview.innerHTML = `<div class="empty-preview">No existing column has source boxes on both sides of this guide.</div>`;
+      }
       pendingSplit = { kind: "split_columns_visual", guideX: value, columns };
     } else if (guideMode.value === "horizontal_split") {
       const rows = affectedRows(value);
       splitTitle.textContent = "Preview row split";
-      splitPreview.innerHTML = rows.length
-        ? `<b>Rows crossing guide:</b><br>${rows.map((row) => `row ${row} -> top + bottom`).join("<br>")}`
-        : "No existing row has source boxes on both sides of this guide.";
+      if (rows.length) {
+        const previewRows = [];
+        for (const rowNumber of rows) {
+          const sourceRow = rowMap.get(Number(rowNumber)) || {};
+          const before = [];
+          const top = [];
+          const bottom = [];
+          for (const [idx, column] of (data.columns || []).entries()) {
+            const cell = cellMap.get(`${rowNumber}:${idx + 1}`);
+            before.push(`${column}: ${sourceRow[column] ?? ""}`);
+            if (!cell) {
+              top.push(`${column}: ${sourceRow[column] ?? ""}`);
+              bottom.push(`${column}:`);
+              continue;
+            }
+            const parts = partitionText(cell.source, "y", value);
+            top.push(`${column}: ${parts.before}`);
+            bottom.push(`${column}: ${parts.after}`);
+          }
+          previewRows.push(`
+            <tr>
+              <td>${escapeHtml(rowNumber)}</td>
+              <td>${escapeHtml(before.join(" | "))}</td>
+              <td>${escapeHtml(top.join(" | "))}</td>
+              <td>${escapeHtml(bottom.join(" | "))}</td>
+            </tr>
+          `);
+        }
+        splitPreview.innerHTML = `
+          <div><b>Rows ${escapeHtml(rows.join(", "))}</b> will be split by the horizontal guide.</div>
+          <table class="split-preview-table">
+            <thead>
+              <tr><th>Row</th><th>Before</th><th>Top row</th><th>Bottom row</th></tr>
+            </thead>
+            <tbody>${previewRows.join("")}</tbody>
+          </table>
+        `;
+      } else {
+        splitPreview.innerHTML = `<div class="empty-preview">No existing row has source boxes on both sides of this guide.</div>`;
+      }
       pendingSplit = { kind: "split_rows_visual", guideY: value, rows };
     }
+    splitForm.querySelector('button[type="submit"]').disabled =
+      (pendingSplit.columns && pendingSplit.columns.length === 0) ||
+      (pendingSplit.rows && pendingSplit.rows.length === 0);
     splitDialog.showModal();
+  }
+
+  function isSplitMode() {
+    return guideMode.value === "vertical_split" || guideMode.value === "horizontal_split";
   }
 
   function openEditDialog(cellElement) {
@@ -687,12 +815,28 @@ export default function(component) {
     cellDialog.showModal();
   }
 
-  pageImage.onclick = (event) => {
-    if (guideMode.value === "inspect") return;
+  pageImage.onpointerdown = (event) => {
+    if (!isSplitMode()) return;
+    drawingGuide = true;
     const point = pagePointFromEvent(event);
-    if (guidePoints.length >= 2) guidePoints = [];
-    guidePoints.push(point);
+    guidePoints = [point];
+    pageImage.setPointerCapture(event.pointerId);
     renderDrawnGuide();
+    event.preventDefault();
+  };
+  pageImage.onpointermove = (event) => {
+    if (!drawingGuide || !isSplitMode()) return;
+    guidePoints[1] = pagePointFromEvent(event);
+    renderDrawnGuide();
+    event.preventDefault();
+  };
+  pageImage.onpointerup = (event) => {
+    if (!drawingGuide || !isSplitMode()) return;
+    drawingGuide = false;
+    guidePoints[1] = pagePointFromEvent(event);
+    pageImage.releasePointerCapture(event.pointerId);
+    renderDrawnGuide();
+    event.preventDefault();
   };
 
   for (const [idx, dot] of [pointA, pointB].entries()) {
@@ -1058,9 +1202,17 @@ POLYGON_SELECTOR = st.components.v2.component(
 
 
 @st.cache_data(show_spinner=False)
-def run_parser(pdf_bytes: bytes, cache_version: str):
+def run_parser(pdf_bytes: bytes, cache_version: str, page_numbers: tuple[int, ...]):
     del cache_version
-    return parse_pdf_pages(pdf_bytes)
+    return parse_pdf_pages(pdf_bytes, page_numbers=list(page_numbers))
+
+
+@st.cache_data(show_spinner=False)
+def get_pdf_page_numbers(pdf_bytes: bytes) -> list[int]:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    page_numbers = list(range(1, len(doc) + 1))
+    doc.close()
+    return page_numbers
 
 
 def build_initial_table(page_results) -> pd.DataFrame:
@@ -1084,6 +1236,7 @@ def initialize_state(file_key: str, initial_df: pd.DataFrame, page_results) -> N
     st.session_state.operation_history = []
     st.session_state.pending_change = None
     st.session_state.page_results = page_results
+    st.session_state.page_drafts = {}
 
 
 def initialize_selective_state(file_key: str, initial_df: pd.DataFrame, page_results, operation: dict[str, Any]) -> None:
@@ -1098,6 +1251,30 @@ def initialize_selective_state(file_key: str, initial_df: pd.DataFrame, page_res
     st.session_state.operation_history = [operation]
     st.session_state.pending_change = None
     st.session_state.page_results = page_results
+    st.session_state.page_drafts = {}
+
+
+def clear_page_drafts() -> None:
+    st.session_state.page_drafts = {}
+
+
+def extraction_state_key(file_key: str, selected_pages: list[int]) -> str:
+    if not selected_pages:
+        return f"{file_key}:all-pages"
+    page_token = ",".join(str(page_number) for page_number in selected_pages)
+    return f"{file_key}:pages:{page_token}"
+
+
+def store_page_draft(state_key: str, page_number: int, page_df: pd.DataFrame) -> None:
+    page_drafts = st.session_state.setdefault("page_drafts", {})
+    page_drafts[(state_key, page_number)] = clone_df(page_df)
+
+
+def page_draft_or_default(state_key: str, page_number: int, base_df: pd.DataFrame) -> pd.DataFrame:
+    draft = st.session_state.get("page_drafts", {}).get((state_key, page_number))
+    if draft is None:
+        return clone_df(base_df)
+    return clone_df(draft)
 
 
 def set_pending(action: str, description: str, preview_df: pd.DataFrame, metadata: dict[str, Any]) -> None:
@@ -1119,6 +1296,7 @@ def accept_pending() -> None:
     st.session_state.redo_stack = []
     st.session_state.operation_history.append(operation_record(pending.action, pending.metadata))
     st.session_state.pending_change = None
+    clear_page_drafts()
 
 
 def reject_pending() -> None:
@@ -1132,6 +1310,7 @@ def undo() -> None:
     st.session_state.corrected_df = st.session_state.history.pop()
     st.session_state.operation_history.append(operation_record("undo", {}))
     st.session_state.pending_change = None
+    clear_page_drafts()
 
 
 def redo() -> None:
@@ -1141,9 +1320,10 @@ def redo() -> None:
     st.session_state.corrected_df = st.session_state.redo_stack.pop()
     st.session_state.operation_history.append(operation_record("redo", {}))
     st.session_state.pending_change = None
+    clear_page_drafts()
 
 
-def commit_page_edits(page_number: int, edited_page_df: pd.DataFrame) -> None:
+def commit_page_edits(state_key: str, page_number: int, edited_page_df: pd.DataFrame) -> None:
     current = st.session_state.corrected_df
     page_mask = current["page_number"] == page_number
     page_indexes = current.index[page_mask].tolist()
@@ -1170,6 +1350,7 @@ def commit_page_edits(page_number: int, edited_page_df: pd.DataFrame) -> None:
     st.session_state.operation_history.append(
         operation_record("edit_cells", {"page_number": page_number})
     )
+    store_page_draft(state_key, page_number, page_dataframe(updated, page_number))
 
 
 def page_dataframe(df: pd.DataFrame, page_number: int) -> pd.DataFrame:
@@ -1305,15 +1486,18 @@ def build_selective_page_result(page_result, polygon: list[dict[str, float]]) ->
 
 
 def load_selective_extraction(file_key: str, selective_result: PageExtractionResult) -> None:
+    version = st.session_state.get("selective_override_version", 0) + 1
+    st.session_state.selective_override_version = version
     st.session_state.selective_override = {
         "file_key": file_key,
         "page_results": [selective_result],
-        "state_key": f"{file_key}:selective:{selective_result.page_number}",
+        "state_key": f"{file_key}:selective:{selective_result.page_number}:{version}",
         "operation": operation_record(
             "selective_extraction",
             {
                 "page_number": selective_result.page_number,
                 "source_item_count": len(selective_result.raw_items),
+                "version": version,
             },
         ),
     }
@@ -1369,7 +1553,7 @@ def handle_visual_split_event(
             st.warning("No merged column crosses the submitted vertical guide.")
             return
 
-        preview_df = split_columns_by_visual_guide(
+        updated_df = split_columns_by_visual_guide(
             corrected_df,
             page_result,
             selected_page,
@@ -1378,17 +1562,24 @@ def handle_visual_split_event(
             event.get("leftName", "left"),
             event.get("rightName", "right"),
         )
-        set_pending(
-            "split_columns_visual",
-            f"Split columns {affected_columns} on page {selected_page} at X={guide_x:.0f}.",
-            preview_df,
-            {
-                "page_number": selected_page,
-                "columns": affected_columns,
-                "guide_x": guide_x,
-                "source": "visual_workspace",
-            },
+        st.session_state.history.append(clone_df(corrected_df))
+        st.session_state.corrected_df = updated_df
+        st.session_state.redo_stack = []
+        st.session_state.operation_history.append(
+            operation_record(
+                "split_columns_visual",
+                {
+                    "page_number": selected_page,
+                    "columns": affected_columns,
+                    "guide_x": guide_x,
+                    "left_name": event.get("leftName", "left"),
+                    "right_name": event.get("rightName", "right"),
+                    "source": "visual_workspace",
+                },
+            )
         )
+        clear_page_drafts()
+        st.success(f"Applied split to columns {affected_columns} on page {selected_page}.")
         st.rerun()
 
     if event.get("kind") == "split_rows_visual":
@@ -1398,24 +1589,29 @@ def handle_visual_split_event(
             st.warning("No merged row crosses the submitted horizontal guide.")
             return
 
-        preview_df = split_rows_by_visual_guide(
+        updated_df = split_rows_by_visual_guide(
             corrected_df,
             page_result,
             selected_page,
             affected_rows,
             guide_y,
         )
-        set_pending(
-            "split_rows_visual",
-            f"Split rows {affected_rows} on page {selected_page} at Y={guide_y:.0f}.",
-            preview_df,
-            {
-                "page_number": selected_page,
-                "rows": affected_rows,
-                "guide_y": guide_y,
-                "source": "visual_workspace",
-            },
+        st.session_state.history.append(clone_df(corrected_df))
+        st.session_state.corrected_df = updated_df
+        st.session_state.redo_stack = []
+        st.session_state.operation_history.append(
+            operation_record(
+                "split_rows_visual",
+                {
+                    "page_number": selected_page,
+                    "rows": affected_rows,
+                    "guide_y": guide_y,
+                    "source": "visual_workspace",
+                },
+            )
         )
+        clear_page_drafts()
+        st.success(f"Applied split to rows {affected_rows} on page {selected_page}.")
         st.rerun()
 
 def handle_visual_edit_event(
@@ -1715,6 +1911,40 @@ def split_row_by_visual_guide(
     return normalize_row_numbers(split_df)
 
 
+def render_page_picker(page_numbers: list[int], state_key: str) -> int:
+    if not page_numbers:
+        raise ValueError("At least one page is required.")
+
+    widget_key = f"active_page_{state_key}"
+    current_page = st.session_state.get(widget_key, page_numbers[0])
+    if current_page not in page_numbers:
+        current_page = page_numbers[0]
+        st.session_state[widget_key] = current_page
+
+    current_index = page_numbers.index(current_page)
+    prev_col, picker_col, next_col = st.columns([0.9, 3.2, 0.9])
+    with prev_col:
+        if st.button("Previous", use_container_width=True, disabled=current_index == 0):
+            st.session_state[widget_key] = page_numbers[current_index - 1]
+            st.rerun()
+    with picker_col:
+        selected_page = st.selectbox(
+            "Extracted page",
+            options=page_numbers,
+            index=page_numbers.index(st.session_state.get(widget_key, current_page)),
+            key=f"{widget_key}_select",
+        )
+        st.session_state[widget_key] = selected_page
+    with next_col:
+        if st.button("Next", use_container_width=True, disabled=current_index == len(page_numbers) - 1):
+            st.session_state[widget_key] = page_numbers[current_index + 1]
+            st.rerun()
+
+    active_page = st.session_state.get(widget_key, selected_page)
+    st.caption(f"Working on page {active_page} of {len(page_numbers)} extracted page(s).")
+    return active_page
+
+
 def main() -> None:
     uploaded_file = st.sidebar.file_uploader("Upload PDF", type=["pdf"])
     zoom = st.sidebar.slider("Preview zoom", min_value=1.0, max_value=4.0, value=2.0, step=0.25)
@@ -1725,7 +1955,49 @@ def main() -> None:
 
     pdf_bytes = uploaded_file.read()
     file_key = get_file_key(pdf_bytes)
-    base_page_results = run_parser(pdf_bytes, PARSER_CACHE_VERSION)
+    all_page_numbers = get_pdf_page_numbers(pdf_bytes)
+    extraction_request = st.session_state.get("extraction_request")
+
+    if not extraction_request or extraction_request.get("file_key") != file_key:
+        st.session_state.extraction_request = {
+            "file_key": file_key,
+            "selected_pages": [],
+            "submitted": False,
+        }
+        extraction_request = st.session_state.extraction_request
+
+    st.sidebar.subheader("Extraction scope")
+    selected_pages = st.sidebar.multiselect(
+        "Pages to extract",
+        options=all_page_numbers,
+        default=extraction_request.get("selected_pages", []),
+        help="Leave this empty to extract all pages in the PDF.",
+        key=f"page_scope_{file_key}",
+    )
+    st.sidebar.caption("Leave the page selector empty to run extraction on every page.")
+
+    run_extraction = st.sidebar.button("Run extraction", type="primary", use_container_width=True)
+    if run_extraction:
+        st.session_state.extraction_request = {
+            "file_key": file_key,
+            "selected_pages": selected_pages,
+            "submitted": True,
+        }
+        st.session_state.selective_override = None
+        st.session_state.file_key = ""
+        clear_page_drafts()
+        st.rerun()
+
+    if not st.session_state.extraction_request.get("submitted"):
+        st.info("Choose pages in the sidebar, or leave the selection empty for all pages, then click `Run extraction`.")
+        st.caption(f"This PDF has {len(all_page_numbers)} page(s).")
+        return
+
+    selected_pages = st.session_state.extraction_request.get("selected_pages", [])
+    active_page_numbers = selected_pages or all_page_numbers
+    active_state_key = extraction_state_key(file_key, active_page_numbers)
+
+    base_page_results = run_parser(pdf_bytes, PARSER_CACHE_VERSION, tuple(active_page_numbers))
 
     if not base_page_results:
         st.warning("No pages were parsed.")
@@ -1734,25 +2006,27 @@ def main() -> None:
     selective_override = st.session_state.get("selective_override")
     if selective_override and selective_override.get("file_key") == file_key:
         page_results = selective_override["page_results"]
-        active_state_key = selective_override["state_key"]
+        selective_state_key = selective_override["state_key"]
         initial_df = build_initial_table(page_results)
         initialize_selective_state(
-            active_state_key,
+            selective_state_key,
             initial_df,
             page_results,
             selective_override["operation"],
         )
+        workspace_state_key = selective_state_key
     else:
         page_results = base_page_results
-        active_state_key = file_key
         initial_df = build_initial_table(page_results)
         initialize_state(active_state_key, initial_df, page_results)
+        workspace_state_key = active_state_key
 
     corrected_df = st.session_state.corrected_df
     page_numbers = [result.page_number for result in page_results]
-    selected_page = st.sidebar.selectbox("Page", options=page_numbers, index=0)
+    selected_page = render_page_picker(page_numbers, workspace_state_key)
     page_result = next(result for result in page_results if result.page_number == selected_page)
     page_df = page_dataframe(corrected_df, selected_page)
+    page_editor_df = page_draft_or_default(workspace_state_key, selected_page, page_df)
     columns = data_columns(corrected_df)
 
     toolbar_cols = st.columns([1, 1, 1, 1, 5])
@@ -1803,16 +2077,18 @@ def main() -> None:
 
     with workspace_left:
         st.subheader(f"Page {selected_page} Manual Cell Editor")
+        st.caption("Draft edits on this page stay in place while you move between pages. Use `Save page edits` to commit them.")
         edited_page_df = st.data_editor(
-            page_df,
+            page_editor_df,
             width="stretch",
             height=430,
             disabled=["row_number"],
             num_rows="fixed",
-            key=f"page_editor_{file_key}_{selected_page}",
+            key=f"page_editor_{workspace_state_key}_{selected_page}",
         )
-        if st.button("Commit cell edits", use_container_width=True):
-            commit_page_edits(selected_page, edited_page_df)
+        store_page_draft(workspace_state_key, selected_page, edited_page_df)
+        if st.button("Save page edits", use_container_width=True):
+            commit_page_edits(workspace_state_key, selected_page, edited_page_df)
             st.rerun()
 
     with workspace_right:
@@ -1988,6 +2264,7 @@ def main() -> None:
             if st.button("Return to full-page extraction", use_container_width=True):
                 st.session_state.selective_override = None
                 st.session_state.file_key = ""
+                clear_page_drafts()
                 st.rerun()
 
         selective_page_number = st.selectbox(
@@ -2034,6 +2311,13 @@ def main() -> None:
             data=dataframe_to_excel(st.session_state.corrected_df),
             file_name="glyphon_corrected_table.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True,
+        )
+        st.download_button(
+            "Download corrected CSV",
+            data=dataframe_to_csv(st.session_state.corrected_df),
+            file_name="glyphon_corrected_table.csv",
+            mime="text/csv",
             use_container_width=True,
         )
         export_metadata = {

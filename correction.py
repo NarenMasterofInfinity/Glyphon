@@ -219,6 +219,10 @@ def dataframe_to_excel(df: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
+def dataframe_to_csv(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
 def operation_record(action: str, metadata: dict[str, Any]) -> dict[str, Any]:
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
