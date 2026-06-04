@@ -39,7 +39,7 @@ from scanned_parser import extract_table_scanned
 st.set_page_config(page_title="Glyphon Table Fixer", layout="wide")
 st.title("Glyphon Table Fixer")
 
-PARSER_CACHE_VERSION = "2026-06-02-correction-workspace-v1"
+PARSER_CACHE_VERSION = "2026-06-03-hybrid-small-text-v2"
 SYSTEM_COLUMNS = ["page_number", "row_number"]
 
 VISUAL_WORKSPACE_HTML = """
