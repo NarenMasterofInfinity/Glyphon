@@ -226,6 +226,9 @@ def phase_controls(phase: str, pipeline: TableFixerPipeline) -> PipelineSnapshot
         if phase == "warnings":
             st.subheader("Cell repairs: before and after")
             show_cell_repairs(source, pending.proposed_snapshot, pending)
+        if phase == "columns":
+            st.subheader("Before structural column repairs")
+            show_tables(source)
         st.subheader("Proposed result")
         show_tables(pending.proposed_snapshot)
         accept, reject = st.columns(2)
@@ -369,7 +372,9 @@ with tabs[3]:
 with tabs[4]:
     accepted = phase_controls("columns", pipeline)
     if accepted:
-        st.subheader("Column repair results")
+        st.subheader("Before structural column repairs")
+        show_tables(st.session_state.phase_snapshots["headers"])
+        st.subheader("After structural column repairs")
         show_tables(accepted)
         st.subheader("Rebased issues")
         st.dataframe(pd.DataFrame([issue.__dict__ for issue in accepted.issues.values()]), use_container_width=True)

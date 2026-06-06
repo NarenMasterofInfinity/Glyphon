@@ -398,6 +398,119 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(result.decisions[0].valid)
         self.assertEqual(len(result.proposed_snapshot.tables["p1_t1"].column_ids), 2)
 
+    def test_placeholder_column_moves_into_empty_named_column(self):
+        snapshot = make_snapshot(
+            [["4", "", "5"], ["5", "", "2"]],
+            column_names=("col_1", "Header 2", "Header 3"),
+        )
+        client = MockClient([{
+            "action": "move",
+            "confidence": 0.99,
+            "reason": "Values fit the empty Header 2 column.",
+            "target_headers": ["Header 2"],
+            "regex": "",
+            "new_header": "",
+        }])
+
+        result = TableFixerPipeline(client).run_columns(snapshot, auto_apply=True)
+        proposed = result.proposed_snapshot
+        table = proposed.tables["p1_t1"]
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(
+            [table.column_names[column_id] for column_id in table.column_ids],
+            ["Header 2", "Header 3"],
+        )
+        self.assertEqual(proposed.cells["p1_t1_r1::p1_t1_c2"].text, "4")
+        self.assertEqual(proposed.cells["p1_t1_r2::p1_t1_c2"].text, "5")
+        self.assertNotIn("p1_t1_r1::p1_t1_c1", proposed.cells)
+
+    def test_placeholder_column_splits_into_two_empty_named_columns(self):
+        snapshot = make_snapshot(
+            [["Alice Engineering", "", ""], ["Bob Finance", "", ""]],
+            column_names=("col_1", "Employee", "Department"),
+        )
+        client = MockClient([{
+            "action": "split",
+            "confidence": 0.99,
+            "reason": "Each value contains employee and department.",
+            "target_headers": ["Employee", "Department"],
+            "regex": r"(?P<employee>\S+)\s+(?P<department>\S+)",
+            "new_header": "",
+        }])
+
+        result = TableFixerPipeline(client).run_columns(snapshot, auto_apply=True)
+        proposed = result.proposed_snapshot
+
+        self.assertEqual(proposed.cells["p1_t1_r1::p1_t1_c2"].text, "Alice")
+        self.assertEqual(proposed.cells["p1_t1_r1::p1_t1_c3"].text, "Engineering")
+        self.assertEqual(proposed.cells["p1_t1_r2::p1_t1_c2"].text, "Bob")
+        self.assertEqual(proposed.cells["p1_t1_r2::p1_t1_c3"].text, "Finance")
+        self.assertNotIn("p1_t1_r1::p1_t1_c1", proposed.cells)
+
+    def test_placeholder_split_repairs_bad_model_regex_with_stable_whitespace(self):
+        snapshot = make_snapshot(
+            [["Alice Engineering", "", ""], ["Bob Finance", "", ""]],
+            column_names=("col_1", "Employee", "Department"),
+        )
+        client = MockClient([{
+            "action": "split",
+            "confidence": 0.99,
+            "reason": "Each value contains employee and department.",
+            "target_headers": ["Employee", "Department"],
+            "regex": ".*",
+            "new_header": "",
+        }])
+
+        result = TableFixerPipeline(client).run_columns(snapshot, auto_apply=True)
+
+        self.assertTrue(result.decisions[0].valid)
+        self.assertTrue(result.decisions[0].applied)
+        self.assertEqual(result.proposed_snapshot.cells["p1_t1_r1::p1_t1_c2"].text, "Alice")
+        self.assertEqual(result.proposed_snapshot.cells["p1_t1_r1::p1_t1_c3"].text, "Engineering")
+
+    def test_placeholder_column_rejects_occupied_destination_atomically(self):
+        snapshot = make_snapshot(
+            [["4", "", "5"], ["5", "occupied", "2"]],
+            column_names=("col_1", "Header 2", "Header 3"),
+        )
+        client = MockClient([{
+            "action": "move",
+            "confidence": 0.99,
+            "reason": "Move values into Header 2.",
+            "target_headers": ["Header 2"],
+            "regex": "",
+            "new_header": "",
+        }])
+
+        result = TableFixerPipeline(client).run_columns(snapshot, auto_apply=True)
+        proposed = result.proposed_snapshot
+
+        self.assertFalse(result.decisions[0].valid)
+        self.assertIn("p1_t1_c1", proposed.tables["p1_t1"].column_ids)
+        self.assertEqual(proposed.cells["p1_t1_r1::p1_t1_c1"].text, "4")
+        self.assertEqual(proposed.cells["p1_t1_r2::p1_t1_c2"].text, "occupied")
+
+    def test_placeholder_column_can_be_renamed_as_distinct_field(self):
+        snapshot = make_snapshot(
+            [["P1001", "Face Wash"], ["P1002", "Sunscreen"]],
+            column_names=("col_1", "Item Name"),
+        )
+        client = MockClient([{
+            "action": "rename",
+            "confidence": 0.99,
+            "reason": "Values are stable item codes.",
+            "target_headers": [],
+            "regex": "",
+            "new_header": "Item Code",
+        }])
+
+        result = TableFixerPipeline(client).run_columns(snapshot, auto_apply=True)
+        table = result.proposed_snapshot.tables["p1_t1"]
+
+        self.assertEqual(table.column_names["p1_t1_c1"], "Item Code")
+        self.assertEqual(result.proposed_snapshot.cells["p1_t1_r1::p1_t1_c1"].text, "P1001")
+
     def test_warning_phase_groups_and_resolves_cell_info_with_warning(self):
         snapshot = make_snapshot([["Bob", "20"]])
         warning_cell = "p1_t1_r1::p1_t1_c1"

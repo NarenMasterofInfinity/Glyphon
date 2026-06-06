@@ -426,6 +426,171 @@ def apply_column_split(
     return result
 
 
+def validate_placeholder_column_action(
+    snapshot: PipelineSnapshot,
+    table_id: str,
+    column_id: str,
+    action: str,
+    target_headers: list[str],
+    regex: str,
+    new_header: str,
+) -> tuple[list[str], dict[str, list[str]], list[str]]:
+    errors: list[str] = []
+    placements: dict[str, list[str]] = {}
+    table = snapshot.tables.get(table_id)
+    if not table or column_id not in table.column_ids:
+        return ["Placeholder column does not exist."], placements, []
+
+    header_to_ids: dict[str, list[str]] = {}
+    for candidate_id in table.column_ids:
+        header_to_ids.setdefault(table.column_names.get(candidate_id, candidate_id), []).append(candidate_id)
+    target_ids: list[str] = []
+    for header in target_headers:
+        matches = header_to_ids.get(header, [])
+        if len(matches) != 1:
+            errors.append(f"Target header must identify exactly one column: {header}")
+        else:
+            target_ids.append(matches[0])
+    if len(set(target_ids)) != len(target_ids):
+        errors.append("Target headers must be distinct.")
+    if column_id in target_ids:
+        errors.append("Placeholder column cannot target itself.")
+
+    source_rows = [
+        row_id for row_id in table.row_ids
+        if (cell := snapshot.cells.get(f"{row_id}::{column_id}")) and cell.text.strip()
+    ]
+    non_data_values = [
+        snapshot.cells[cell_id].text
+        for row_id in table.metadata_row_ids + table.header_row_ids
+        if (cell_id := f"{row_id}::{column_id}") in snapshot.cells
+        and snapshot.cells[cell_id].text.strip()
+    ]
+    if action in {"move", "split"} and non_data_values:
+        errors.append("Cannot remove a placeholder column with non-empty metadata or header cells.")
+    if action == "move":
+        if len(target_headers) != 1 or regex or new_header:
+            errors.append("Move requires one target header and no regex or new header.")
+        for row_id in source_rows:
+            if len(target_ids) != 1:
+                break
+            destination = snapshot.cells.get(f"{row_id}::{target_ids[0]}")
+            if not destination or destination.text.strip():
+                errors.append(f"Move destination is occupied or missing on row {snapshot.rows[row_id].source_row_number}.")
+                continue
+            placements[row_id] = [snapshot.cells[f"{row_id}::{column_id}"].text]
+    elif action == "split":
+        if not 2 <= len(target_headers) <= 3 or new_header:
+            errors.append("Split requires 2-3 target headers and no new header.")
+        compiled = None
+        if len(regex) > 300 or any(part in regex for part in UNSAFE_REGEX_PARTS):
+            errors.append("Regex uses an unsafe or excessively long construct.")
+        else:
+            try:
+                compiled = re.compile(regex)
+            except re.error as exc:
+                errors.append(f"Invalid regex: {exc}")
+        if compiled:
+            group_names = list(compiled.groupindex)
+            if compiled.groups != len(group_names) or len(group_names) != len(target_headers):
+                errors.append("Split regex must have one named group per target header and no unnamed groups.")
+            for row_id in source_rows:
+                source = snapshot.cells[f"{row_id}::{column_id}"].text
+                match = compiled.fullmatch(source)
+                if not match:
+                    errors.append(f"Split regex does not full-match row {snapshot.rows[row_id].source_row_number}.")
+                    continue
+                values = [str(match.group(name) or "").strip() for name in group_names]
+                if any(not value for value in values):
+                    errors.append(f"Split produced an empty value on row {snapshot.rows[row_id].source_row_number}.")
+                if Counter(re.findall(r"\S+", source)) != Counter(
+                    token for value in values for token in re.findall(r"\S+", value)
+                ):
+                    errors.append(f"Split must preserve every token on row {snapshot.rows[row_id].source_row_number}.")
+                if len(target_ids) == len(target_headers):
+                    for target_id in target_ids:
+                        destination = snapshot.cells.get(f"{row_id}::{target_id}")
+                        if not destination or destination.text.strip():
+                            errors.append(
+                                f"Split destination is occupied or missing on row "
+                                f"{snapshot.rows[row_id].source_row_number}."
+                            )
+                    placements[row_id] = values
+    elif action == "rename":
+        if target_headers or regex or not new_header.strip():
+            errors.append("Rename requires only a non-empty new header.")
+        if re.fullmatch(r"col_\d+", new_header.strip(), re.IGNORECASE):
+            errors.append("New header cannot be another placeholder.")
+        if new_header.strip() in header_to_ids:
+            errors.append("New header must be unique in the table.")
+    elif action == "unresolved":
+        if target_headers or regex or new_header:
+            errors.append("Unresolved must not include targets, regex, or a new header.")
+    else:
+        errors.append(f"Unsupported placeholder action: {action}")
+    return sorted(set(errors)), placements, target_ids
+
+
+def apply_placeholder_column_action(
+    snapshot: PipelineSnapshot,
+    record: DecisionRecord,
+    placements: dict[str, list[str]],
+    target_ids: list[str],
+) -> PipelineSnapshot:
+    result = snapshot.clone(f"snapshot_columns_{uuid4().hex[:8]}", "columns")
+    result.decisions.append(record)
+    table = result.tables[record.payload["table_id"]]
+    source_id = record.payload["column_id"]
+    action = record.action
+    if action == "rename":
+        table.column_names[source_id] = record.payload["new_header"].strip()
+        record.applied = True
+        record.affected_ids = [source_id]
+        return result
+    if action == "unresolved":
+        return result
+
+    affected: list[str] = []
+    all_rows = table.metadata_row_ids + table.header_row_ids + table.row_ids
+    for row_id in table.row_ids:
+        old_cell_id = f"{row_id}::{source_id}"
+        old_cell = result.cells.get(old_cell_id)
+        if not old_cell or row_id not in placements:
+            continue
+        descendants = []
+        for target_id, value in zip(target_ids, placements[row_id]):
+            target_cell = result.cells[f"{row_id}::{target_id}"]
+            target_cell.text = value
+            target_cell.source_item_indexes.extend(
+                index for index in old_cell.source_item_indexes
+                if index not in target_cell.source_item_indexes
+            )
+            target_cell.ancestor_cell_ids = list(dict.fromkeys(
+                [old_cell_id] + old_cell.ancestor_cell_ids + target_cell.ancestor_cell_ids
+            ))
+            descendants.append(target_cell.cell_id)
+            affected.append(target_cell.cell_id)
+        result.cell_lineage[old_cell_id] = descendants
+        for issue in result.issues.values():
+            if old_cell_id in issue.affected_cell_ids:
+                issue.affected_cell_ids = list(dict.fromkeys(
+                    descendants if issue.affected_cell_ids == [old_cell_id]
+                    else [item for item in issue.affected_cell_ids if item != old_cell_id] + descendants
+                ))
+        for descendant in descendants:
+            result.cells[descendant].warning_ids = list(dict.fromkeys(
+                result.cells[descendant].warning_ids + old_cell.warning_ids
+            ))
+    for row_id in all_rows:
+        result.cells.pop(f"{row_id}::{source_id}", None)
+    table.column_ids.remove(source_id)
+    table.column_names.pop(source_id, None)
+    result.column_lineage[source_id] = target_ids
+    record.applied = True
+    record.affected_ids = affected
+    return result
+
+
 def _rebase_cell_issues(snapshot: PipelineSnapshot, old_cell: CellState, descendants: list[str]) -> None:
     for issue_id in old_cell.warning_ids:
         issue = snapshot.issues.get(issue_id)

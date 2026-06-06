@@ -399,6 +399,93 @@ def column_split_context(snapshot: PipelineSnapshot, issue_id: str, sample_limit
     }
 
 
+def placeholder_column_context(
+    snapshot: PipelineSnapshot,
+    table_id: str,
+    column_id: str,
+    sample_limit: int = 10,
+) -> dict[str, Any]:
+    table = snapshot.tables[table_id]
+    source_position = table.column_ids.index(column_id)
+    source_values = [
+        snapshot.cells[cell_id].text
+        for row_id in table.row_ids
+        if (cell_id := f"{row_id}::{column_id}") in snapshot.cells
+        and snapshot.cells[cell_id].text.strip()
+    ]
+    candidates = []
+    for position, candidate_id in enumerate(table.column_ids):
+        header = table.column_names.get(candidate_id, candidate_id)
+        if candidate_id == column_id or re.fullmatch(r"col_\d+", header, re.IGNORECASE):
+            continue
+        relevant_rows = [
+            row_id for row_id in table.row_ids
+            if snapshot.cells.get(f"{row_id}::{column_id}")
+            and snapshot.cells[f"{row_id}::{column_id}"].text.strip()
+        ]
+        occupied = sum(
+            bool(snapshot.cells.get(f"{row_id}::{candidate_id}")
+                 and snapshot.cells[f"{row_id}::{candidate_id}"].text.strip())
+            for row_id in relevant_rows
+        )
+        examples = [
+            snapshot.cells[cell_id].text
+            for row_id in table.row_ids
+            if (cell_id := f"{row_id}::{candidate_id}") in snapshot.cells
+            and snapshot.cells[cell_id].text.strip()
+        ][:3]
+        candidates.append({
+            "header": header,
+            "position": "left" if position < source_position else "right",
+            "distance": abs(position - source_position),
+            "empty_where_placeholder_has_value": occupied == 0,
+            "examples": examples,
+        })
+    candidates.sort(key=lambda candidate: (candidate["distance"], candidate["header"]))
+    return {
+        "task": (
+            "Remove this placeholder column without losing data. Choose one reusable rule for the whole column. "
+            "First decide whether each value is one semantic field or contains multiple semantic fields described "
+            "by the candidate headers. Move only when each complete value is one field matching one named column; "
+            "do not move a merged multi-field value into one column merely because that column is empty. "
+            "Split when every value has the same semantic parts matching multiple empty named columns. "
+            "Rename it when it is a genuine distinct field. Otherwise return unresolved."
+        ),
+        "placeholder_header": table.column_names.get(column_id, column_id),
+        "sample_values": source_values[:sample_limit],
+        "candidate_named_columns": candidates[:6],
+        "examples_only_do_not_copy": [
+            {
+                "placeholder_values": ["Alice Engineering", "Bob Finance"],
+                "empty_candidate_headers": ["Employee", "Department"],
+                "decision": "split into Employee and Department",
+                "why": "Each value contains a person and a department, matching two headers.",
+            },
+            {
+                "placeholder_values": ["Face Wash", "Night Cream"],
+                "empty_candidate_headers": ["Item Name", "Qty"],
+                "decision": "move complete values into Item Name",
+                "why": "Each value is one multiword item name; no part is a quantity.",
+            },
+        ],
+        "response_rules": {
+            "move": (
+                "Use only for one semantic field. Return exactly one target_headers entry; leave regex and "
+                "new_header empty."
+            ),
+            "split": (
+                "Use when repeated values contain fields matching multiple candidate headers. Return 2-3 "
+                "target_headers in capture order and a Python full-match regex with the same number of named "
+                "groups; leave new_header empty."
+            ),
+            "rename": "Return a meaningful new_header; leave target_headers and regex empty.",
+            "unresolved": "Use only when no lossless whole-column rule fits.",
+        },
+        "_table_id": table_id,
+        "_column_id": column_id,
+    }
+
+
 def warning_context(snapshot: PipelineSnapshot, issue_id: str) -> dict[str, Any]:
     issue = snapshot.issues[issue_id]
     cell_id = next((value for value in issue.affected_cell_ids if value in snapshot.cells), "")

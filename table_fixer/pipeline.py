@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -16,6 +17,7 @@ from .context import (
     header_context,
     metadata_candidate_prefix,
     metadata_context,
+    placeholder_column_context,
     row_repair_context,
     table_pair_evidence,
     table_reconciliation_context,
@@ -33,17 +35,20 @@ from .repairs import (
     apply_column_split,
     apply_headers,
     apply_metadata,
+    apply_placeholder_column_action,
     apply_table_reconciliation,
     apply_warning_decisions,
     decision,
     infer_whitespace_split,
     validate_split_regex,
+    validate_placeholder_column_action,
     validate_warning_action,
 )
 from .schemas import (
     COLUMN_SPLIT_SCHEMA,
     HEADER_SCHEMA,
     METADATA_SCHEMA,
+    PLACEHOLDER_COLUMN_SCHEMA,
     TABLE_RECONCILIATION_SCHEMA,
     ROW_REPAIR_SCHEMA,
 )
@@ -69,6 +74,13 @@ SYSTEM_PROMPTS = {
         "current header combines their names. "
         "If yes, return a Python full-match regex with 2-4 named groups and clear field headers. "
         "If no, return no_split. Do not repeat the prompt. Return only schema JSON."
+    ),
+    "placeholder_column": (
+        "Resolve one unnamed placeholder column using one lossless whole-column rule. A move is valid only when "
+        "each complete value is one semantic field matching one empty named column. Never move a merged multi-field "
+        "value wholly into one target merely because it is empty. Split when repeated values contain separate fields "
+        "described by multiple empty named columns and every value follows the same pattern. Rename only when the "
+        "values form a genuine distinct field. Return unresolved when none is reliable. Return only schema JSON."
     ),
     "warnings": (
         "Repair the one supplied row problem. Consider only the listed columns. Arrange available_parts under the "
@@ -598,6 +610,138 @@ class TableFixerPipeline:
                 if action == "no_split" and valid:
                     current.issues[issue_id].status = "dismissed"
                     record.applied = True
+
+        for table_id in list(current.tables):
+            table = current.tables[table_id]
+            placeholder_ids = [
+                column_id for column_id in table.column_ids
+                if re.fullmatch(r"col_\d+", table.column_names.get(column_id, column_id), re.IGNORECASE)
+            ]
+            for column_id in placeholder_ids:
+                if column_id not in current.tables[table_id].column_ids:
+                    continue
+                values = [
+                    current.cells[cell_id].text
+                    for row_id in current.tables[table_id].row_ids
+                    if (cell_id := f"{row_id}::{column_id}") in current.cells
+                    and current.cells[cell_id].text.strip()
+                ]
+                all_values = [
+                    current.cells[cell_id].text
+                    for row_id in (
+                        current.tables[table_id].metadata_row_ids
+                        + current.tables[table_id].header_row_ids
+                        + current.tables[table_id].row_ids
+                    )
+                    if (cell_id := f"{row_id}::{column_id}") in current.cells
+                    and current.cells[cell_id].text.strip()
+                ]
+                target_id = f"placeholder:{table_id}:{column_id}"
+                if not all_values:
+                    record = decision(
+                        "columns",
+                        target_id,
+                        "remove_empty",
+                        1.0,
+                        "Placeholder column is empty in all data, metadata, and header rows.",
+                        {"table_id": table_id, "column_id": column_id},
+                        True,
+                        [],
+                        None,
+                    )
+                    records.append(record)
+                    current = apply_placeholder_column_action(current, record, {}, [])
+                    continue
+                if not values:
+                    record = decision(
+                        "columns",
+                        target_id,
+                        "unresolved",
+                        0.0,
+                        "Placeholder has no data-row values but has preserved metadata or header text.",
+                        {
+                            "table_id": table_id,
+                            "column_id": column_id,
+                            "target_headers": [],
+                            "regex": "",
+                            "new_header": "",
+                        },
+                        True,
+                        [],
+                        None,
+                    )
+                    records.append(record)
+                    current = apply_placeholder_column_action(current, record, {}, [])
+                    continue
+
+                context = fit_context_budget(
+                    placeholder_column_context(current, table_id, column_id),
+                    self.client.token_counter,
+                    self.context_token_budget,
+                    "sample_values",
+                )
+                private_table_id = context.pop("_table_id")
+                private_column_id = context.pop("_column_id")
+                response = self._call(
+                    "placeholder_column",
+                    target_id,
+                    context,
+                    PLACEHOLDER_COLUMN_SCHEMA,
+                )
+                responses.append(response)
+                parsed = response.parsed or {}
+                action = parsed.get("action", "unresolved")
+                confidence = float(parsed.get("confidence", 0))
+                payload = {
+                    "table_id": private_table_id,
+                    "column_id": private_column_id,
+                    "target_headers": parsed.get("target_headers", []),
+                    "regex": parsed.get("regex", ""),
+                    "new_header": parsed.get("new_header", ""),
+                }
+                errors = list(response.validation_errors)
+                validation_errors, placements, target_ids = validate_placeholder_column_action(
+                    current,
+                    private_table_id,
+                    private_column_id,
+                    action,
+                    payload["target_headers"],
+                    payload["regex"],
+                    payload["new_header"],
+                )
+                errors.extend(validation_errors)
+                if action == "split" and errors:
+                    inferred = infer_whitespace_split(" ".join(payload["target_headers"]), values)
+                    if inferred and len(inferred[1]) == len(payload["target_headers"]):
+                        payload["regex"] = inferred[0]
+                        errors, placements, target_ids = validate_placeholder_column_action(
+                            current,
+                            private_table_id,
+                            private_column_id,
+                            action,
+                            payload["target_headers"],
+                            payload["regex"],
+                            payload["new_header"],
+                        )
+                valid = not errors and (
+                    not auto_apply or confidence >= self.structural_auto_apply_threshold
+                )
+                record = decision(
+                    "columns",
+                    target_id,
+                    action,
+                    confidence,
+                    parsed.get("reason", ""),
+                    payload,
+                    valid,
+                    sorted(set(errors)),
+                    response.prompt_id,
+                )
+                records.append(record)
+                if valid and action in {"move", "split", "rename", "unresolved"}:
+                    current = apply_placeholder_column_action(current, record, placements, target_ids)
+                else:
+                    current.decisions.append(record)
         self._attach_responses(current, responses)
         return PhaseRun("columns", snapshot.snapshot_id, current, records, responses)
 

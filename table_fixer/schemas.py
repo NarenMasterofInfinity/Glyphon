@@ -47,6 +47,33 @@ COLUMN_SPLIT_SCHEMA = {
     "required": ["action", "confidence", "reason", "regex", "new_headers", "expected"],
 }
 
+PLACEHOLDER_COLUMN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {
+            "type": "string",
+            "enum": ["move", "split", "rename", "unresolved"],
+        },
+        "confidence": CONFIDENCE,
+        "reason": {"type": "string"},
+        "target_headers": {
+            "type": "array",
+            "items": {"type": "string"},
+            "maxItems": 3,
+        },
+        "regex": {"type": "string"},
+        "new_header": {"type": "string"},
+    },
+    "required": [
+        "action",
+        "confidence",
+        "reason",
+        "target_headers",
+        "regex",
+        "new_header",
+    ],
+}
+
 ROW_REPAIR_SCHEMA = {
     "type": "object",
     "properties": {
