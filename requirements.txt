@@ -1,6 +1,6 @@
 streamlit
 PyMuPDF
-rapidocr-onnxruntime
+rapidocr-onnxruntime==1.2.3
 Pillow
 numpy
 pandas
