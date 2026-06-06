@@ -152,6 +152,88 @@ def _issue(
     return issue_id
 
 
+def _add_merged_column_issues(issues: list[dict], cells: list[dict], page_number: int) -> None:
+    """Promote repeated row-level merge evidence into a column-level warning."""
+    evidence_by_column: dict[tuple[int, int, int], list[dict]] = {}
+    issue_lookup = {issue["issue_id"]: issue for issue in issues}
+
+    for cell in cells:
+        related = [
+            issue_lookup[issue_id]
+            for issue_id in cell["issue_ids"]
+            if issue_id in issue_lookup
+            and issue_lookup[issue_id]["issue_type"] in {"possible_cell_collision", "item_crosses_boundary"}
+        ]
+        if not related:
+            continue
+
+        key = (cell["table_index"], cell["layout_region_index"], cell["col_index"])
+        for issue in related:
+            split_positions = []
+            evidence = issue.get("evidence", {})
+            if evidence.get("estimated_split_x") is not None:
+                split_positions.append(evidence["estimated_split_x"])
+            split_positions.extend(evidence.get("crossed_boundaries", []))
+            evidence_by_column.setdefault(key, []).append(
+                {
+                    "row_index": cell["row_index"],
+                    "source_item_indexes": cell["source_item_indexes"],
+                    "issue_id": issue["issue_id"],
+                    "split_positions": split_positions,
+                }
+            )
+
+    for (table_index, layout_region_index, col_index), entries in evidence_by_column.items():
+        affected_rows = sorted({entry["row_index"] for entry in entries})
+        if len(affected_rows) < 2:
+            continue
+
+        split_positions = [
+            position
+            for entry in entries
+            for position in entry["split_positions"]
+        ]
+        estimated_split = float(median(split_positions)) if split_positions else None
+        source_item_indexes = sorted({
+            source_index
+            for entry in entries
+            for source_index in entry["source_item_indexes"]
+        })
+        supporting_issue_ids = sorted({entry["issue_id"] for entry in entries})
+        issue_id = _issue(
+            issues,
+            "possible_merged_column",
+            "warning",
+            page_number,
+            table_index,
+            layout_region_index,
+            (
+                f"col_{col_index} repeatedly contains merge-like geometry across "
+                f"{len(affected_rows)} rows and may represent multiple physical columns."
+            ),
+            "Review the affected rows and consider splitting this entire column near the estimated x-position.",
+            row_index=None,
+            col_index=col_index,
+            source_item_indexes=source_item_indexes,
+            chosen_placement={"col_index": col_index},
+            alternatives=[],
+            evidence={
+                "affected_rows": affected_rows,
+                "support_count": len(affected_rows),
+                "estimated_split_x": estimated_split,
+                "supporting_issue_ids": supporting_issue_ids,
+            },
+        )
+        for cell in cells:
+            if (
+                cell["table_index"] == table_index
+                and cell["layout_region_index"] == layout_region_index
+                and cell["col_index"] == col_index
+                and cell["row_index"] in affected_rows
+            ):
+                cell["issue_ids"].append(issue_id)
+
+
 def extract_table_scanned(
     items: list[BBoxItem],
     page_width: float,
@@ -171,7 +253,7 @@ def extract_table_scanned(
     row_table_indexes: list[int] = []
     row_layout_region_indexes: list[int] = []
     row_index = 1
-    table_index = 0
+    table_index = 1
     previous_centers: list[float] | None = None
     item_heights = [item.height for item in items if item.height > 0]
     layout_tolerance = max(18.0, (median(item_heights) * 2.0) if item_heights else 20.0)
@@ -193,12 +275,9 @@ def extract_table_scanned(
         column_centers = _boundaries_to_centers(boundaries, alignment_rows)
         segment_column_centers.append(column_centers)
 
-        if previous_centers is None:
-            table_index = 1
-        else:
+        if previous_centers is not None:
             compatible, layout_distance = _layouts_compatible(previous_centers, column_centers, layout_tolerance)
             if not compatible:
-                table_index += 1
                 _issue(
                     issues,
                     "incompatible_layout_regions",
@@ -207,10 +286,10 @@ def extract_table_scanned(
                     table_index,
                     layout_region_index,
                     (
-                        f"Layout region {layout_region_index} was kept as a separate table because its "
-                        f"column geometry differs from the preceding region."
+                        f"Layout region {layout_region_index} has column geometry that differs from the "
+                        f"preceding region, but remains in the same source table."
                     ),
-                    "Process this region as a separate table or explicitly reconcile its columns.",
+                    "Use metadata/header decisions to split logical tables only when the content supports it.",
                     row_index=row_index,
                     col_index=None,
                     source_item_indexes=[],
@@ -410,14 +489,15 @@ def extract_table_scanned(
                         for issue_id in item_assignment_data[id(item)]["issue_ids"]
                     })
                     if len(cell_items) > 1:
+                        ordered_cell_items = sorted(cell_items, key=lambda entry: entry.x0)
+                        item_pairs = list(zip(ordered_cell_items, ordered_cell_items[1:]))
                         gaps = [
                             right.x0 - left.x1
-                            for left, right in zip(
-                                sorted(cell_items, key=lambda entry: entry.x0),
-                                sorted(cell_items, key=lambda entry: entry.x0)[1:],
-                            )
+                            for left, right in item_pairs
                         ]
                         if gaps and max(gaps) > max(18.0, median(item_heights) * 2.0 if item_heights else 18.0):
+                            largest_gap_index = gaps.index(max(gaps))
+                            gap_left, gap_right = item_pairs[largest_gap_index]
                             cell_issue_ids.append(
                                 _issue(
                                     issues,
@@ -433,7 +513,10 @@ def extract_table_scanned(
                                     source_item_indexes=[item_indexes[id(item)] for item in cell_items],
                                     chosen_placement={"row_index": row_index, "col_index": col_index},
                                     alternatives=[],
-                                    evidence={"largest_internal_gap": max(gaps)},
+                                    evidence={
+                                        "largest_internal_gap": max(gaps),
+                                        "estimated_split_x": (gap_left.x1 + gap_right.x0) / 2,
+                                    },
                                 )
                             )
                     cells.append(
@@ -506,6 +589,8 @@ def extract_table_scanned(
                     "issue_ids": [],
                 }
             )
+
+    _add_merged_column_issues(issues, cells, page_number)
 
     return {
         "slant_angle": slant_angle,

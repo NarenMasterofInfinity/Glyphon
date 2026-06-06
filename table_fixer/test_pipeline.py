@@ -1,0 +1,457 @@
+from __future__ import annotations
+
+import unittest
+from dataclasses import replace
+from pathlib import Path
+from tempfile import TemporaryDirectory
+
+from table_fixer.context import ensure_profiles, header_context, metadata_context
+from table_fixer.models import (
+    CellState,
+    IssueState,
+    LogicalTable,
+    PipelineSnapshot,
+    PromptUsage,
+    RowState,
+)
+from table_fixer.ollama_client import OllamaLLMClient, StructuredResponse
+from table_fixer.pipeline import TableFixerPipeline, normalize_header_groups
+from table_fixer.repairs import apply_headers, decision
+from table_fixer.token_counting import TokenCounter
+from table_fixer.workspace import persist_snapshot
+
+
+class MockClient:
+    model = "mock"
+    token_counter = TokenCounter()
+
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def structured(self, **kwargs):
+        self.calls.append(kwargs)
+        parsed = self.responses.pop(0)
+        prompt_id = f"prompt_{len(self.calls)}"
+        usage = PromptUsage(
+            prompt_id=prompt_id,
+            phase=kwargs["phase"],
+            purpose=kwargs["purpose"],
+            model="mock",
+            system_tokens=5,
+            context_tokens=10,
+            input_tokens=15,
+            output_tokens=5,
+            duration_ms=1.0,
+        )
+        return StructuredResponse(prompt_id, parsed, "{}", [], usage)
+
+
+def make_snapshot(row_values, column_names=("col_1", "col_2"), issues=None):
+    table_id = "p1_t1"
+    column_ids = [f"{table_id}_c{index}" for index in range(1, len(column_names) + 1)]
+    table = LogicalTable(
+        table_id=table_id,
+        page_number=1,
+        source_table_index=1,
+        column_ids=column_ids,
+        column_names=dict(zip(column_ids, column_names)),
+        row_ids=[],
+    )
+    rows = {}
+    cells = {}
+    for row_number, values in enumerate(row_values, start=1):
+        row_id = f"{table_id}_r{row_number}"
+        table.row_ids.append(row_id)
+        rows[row_id] = RowState(row_id, 1, row_number, table_id, ancestor_row_ids=[row_id])
+        for index, value in enumerate(values, start=1):
+            column_id = column_ids[index - 1]
+            cell_id = f"{row_id}::{column_id}"
+            cells[cell_id] = CellState(
+                cell_id=cell_id,
+                row_id=row_id,
+                column_id=column_id,
+                text=value,
+                bbox=(10.0 * index, 10.0 * row_number, 10.0 * index + 8, 10.0 * row_number + 5),
+                ancestor_cell_ids=[cell_id],
+            )
+    snapshot = PipelineSnapshot(
+        snapshot_id="source",
+        phase="source",
+        tables={table_id: table},
+        rows=rows,
+        cells=cells,
+        issues=issues or {},
+        page_dimensions={1: (200.0, 200.0)},
+    )
+    ensure_profiles(snapshot)
+    return snapshot
+
+
+def append_table(snapshot, table_index, row_values, column_names=("col_1", "col_2")):
+    table_id = f"p1_t{table_index}"
+    column_ids = [f"{table_id}_c{index}" for index in range(1, len(column_names) + 1)]
+    table = LogicalTable(
+        table_id=table_id,
+        page_number=1,
+        source_table_index=table_index,
+        column_ids=column_ids,
+        column_names=dict(zip(column_ids, column_names)),
+        row_ids=[],
+        ancestor_table_ids=[table_id],
+    )
+    start = max((row.source_row_number for row in snapshot.rows.values()), default=0) + 1
+    for row_number, values in enumerate(row_values, start=start):
+        row_id = f"{table_id}_r{row_number}"
+        table.row_ids.append(row_id)
+        snapshot.rows[row_id] = RowState(row_id, 1, row_number, table_id, ancestor_row_ids=[row_id])
+        for index, value in enumerate(values, start=1):
+            column_id = column_ids[index - 1]
+            cell_id = f"{row_id}::{column_id}"
+            snapshot.cells[cell_id] = CellState(
+                cell_id=cell_id,
+                row_id=row_id,
+                column_id=column_id,
+                text=value,
+                bbox=(10.0 * index, 10.0 * row_number, 10.0 * index + 8, 10.0 * row_number + 5),
+                ancestor_cell_ids=[cell_id],
+            )
+    snapshot.tables[table_id] = table
+    ensure_profiles(snapshot)
+    return table_id
+
+
+def make_adjacent_tables(left_rows, right_rows, column_names=("col_1", "col_2")):
+    snapshot = make_snapshot(left_rows, column_names)
+    append_table(snapshot, 2, right_rows, column_names)
+    return snapshot
+
+
+class PipelineTests(unittest.TestCase):
+    def test_structured_client_records_native_and_estimated_usage(self):
+        client = OllamaLLMClient(model="mock")
+        client._post = lambda path, payload: {
+            "message": {"content": '{"answer":"yes"}'},
+            "prompt_eval_count": 21,
+            "eval_count": 4,
+        }
+
+        response = client.structured(
+            phase="metadata",
+            purpose="usage-test",
+            system="Return JSON.",
+            context={"row": "Title"},
+            schema={"type": "object"},
+        )
+
+        self.assertTrue(response.valid)
+        self.assertEqual(response.usage.native_prompt_tokens, 21)
+        self.assertEqual(response.usage.native_output_tokens, 4)
+        self.assertGreater(response.usage.input_tokens, 0)
+        self.assertEqual(response.audit_record()["context"], {"row": "Title"})
+
+    def test_workspace_snapshot_writes_json_and_table_csv(self):
+        snapshot = make_snapshot([["Name", "Age"], ["Bob", "20"]])
+        with TemporaryDirectory() as directory:
+            persist_snapshot(Path(directory), "source", snapshot)
+
+            self.assertTrue((Path(directory) / "source" / "snapshot.json").exists())
+            self.assertTrue((Path(directory) / "source" / "issues.json").exists())
+            self.assertTrue((Path(directory) / "source" / "tables" / "p1_t1.csv").exists())
+
+    def test_metadata_context_is_adaptive(self):
+        structured = make_snapshot([["A", "B"]] + [[str(index), str(index + 1)] for index in range(1, 20)])
+        self.assertEqual(len(metadata_context(structured, "p1_t1")["rows"]), 12)
+
+        unstructured = make_snapshot([[f"metadata {index}", ""] for index in range(20)])
+        self.assertEqual(len(metadata_context(unstructured, "p1_t1")["rows"]), 20)
+
+    def test_reconciliation_deterministically_merges_compatible_adjacent_tables(self):
+        snapshot = make_adjacent_tables([["A", "1"], ["B", "2"]], [["C", "3"], ["D", "4"]])
+        client = MockClient([])
+
+        result = TableFixerPipeline(client).run_reconciliation(snapshot)
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(list(result.proposed_snapshot.tables), ["p1_t1"])
+        self.assertEqual(len(result.proposed_snapshot.tables["p1_t1"].row_ids), 4)
+        remapped = "p1_t2_r3::p1_t1_c1"
+        self.assertIn(remapped, result.proposed_snapshot.cells)
+        self.assertIn("p1_t2_r3::p1_t2_c1", result.proposed_snapshot.cell_lineage)
+
+    def test_reconciliation_keeps_distinct_titled_table_separate(self):
+        snapshot = make_adjacent_tables(
+            [["A", "1"], ["B", "2"]],
+            [["Table 2", ""], ["Name", "Value"], ["C", "3"]],
+        )
+        client = MockClient([])
+
+        result = TableFixerPipeline(client).run_reconciliation(snapshot)
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(set(result.proposed_snapshot.tables), {"p1_t1", "p1_t2"})
+        self.assertEqual(result.decisions[0].action, "keep_separate")
+
+    def test_reconciliation_uses_compact_llm_call_for_ambiguous_pair(self):
+        snapshot = make_adjacent_tables([["A", "1"], ["B", "2"]], [["C", "3"], ["D", "4"]])
+        for cell in snapshot.table_cells("p1_t2"):
+            x0, y0, x1, y1 = cell.bbox
+            cell.bbox = (x0 + 8, y0, x1 + 8, y1)
+        client = MockClient([{"action": "merge", "confidence": 0.96, "reason": "continuation"}])
+
+        result = TableFixerPipeline(client).run_reconciliation(snapshot)
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertLessEqual(len(client.calls[0]["context"]["left_tail"]), 3)
+        self.assertLessEqual(len(client.calls[0]["context"]["right_head"]), 3)
+        self.assertEqual(list(result.proposed_snapshot.tables), ["p1_t1"])
+
+    def test_reconciliation_merges_compatible_chain_in_one_phase(self):
+        snapshot = make_adjacent_tables([["A", "1"]], [["B", "2"]])
+        append_table(snapshot, 3, [["C", "3"]])
+
+        result = TableFixerPipeline(MockClient([])).run_reconciliation(snapshot)
+
+        self.assertEqual(list(result.proposed_snapshot.tables), ["p1_t1"])
+        self.assertEqual(len(result.proposed_snapshot.tables["p1_t1"].row_ids), 3)
+
+    def test_header_context_includes_predecessor_tail_at_segment_start(self):
+        snapshot = make_adjacent_tables([["Header part", ""]], [["Name", "Value"], ["C", "3"]])
+
+        context = header_context(snapshot, "p1_t2", "p1_t2_r2")
+
+        self.assertEqual(context["predecessor_tail_context_only"][0]["row_id"], "p1_t1_r1")
+
+    def test_metadata_preserves_prefix_and_records_usage(self):
+        snapshot = make_snapshot([["Title", ""], ["Subtitle", ""], ["Name", "Age"], ["Bob", "20"]])
+        client = MockClient([{
+            "metadata_row_ids": ["p1_t1_r1", "p1_t1_r2"],
+            "header_continuation_row_ids": [],
+            "confidence": 0.9,
+            "reasons": {"p1_t1_r1": "title", "p1_t1_r2": "subtitle"},
+        }])
+
+        result = TableFixerPipeline(client).run_metadata(snapshot)
+
+        table = result.proposed_snapshot.tables["p1_t1"]
+        self.assertEqual(table.metadata_row_ids, ["p1_t1_r1", "p1_t1_r2"])
+        self.assertEqual(table.row_ids[0], "p1_t1_r3")
+        self.assertEqual(len(result.proposed_snapshot.prompt_usage), 1)
+        self.assertEqual(len(result.proposed_snapshot.prompt_audits), 1)
+
+    def test_metadata_clamps_runaway_response_to_allowed_prefix(self):
+        snapshot = make_snapshot([["Table 1", ""], ["Name", "Age"], ["Bob", "20"]])
+        client = MockClient([{
+            "metadata_row_ids": ["p1_t1_r1", "p1_t1_r2", "p1_t1_r3"] + ["p1_t1_r3"] * 100,
+            "header_continuation_row_ids": [],
+            "confidence": 0.95,
+            "reasons": {},
+        }])
+
+        result = TableFixerPipeline(client).run_metadata(snapshot)
+
+        self.assertEqual(result.proposed_snapshot.tables["p1_t1"].metadata_row_ids, ["p1_t1_r1"])
+        self.assertEqual(result.proposed_snapshot.tables["p1_t1"].row_ids, ["p1_t1_r2", "p1_t1_r3"])
+
+    def test_auto_apply_rejects_low_confidence(self):
+        snapshot = make_snapshot([["Title", ""], ["Name", "Age"]])
+        client = MockClient([{
+            "metadata_row_ids": ["p1_t1_r1"],
+            "header_continuation_row_ids": [],
+            "confidence": 0.7,
+            "reasons": {},
+        }])
+
+        result = TableFixerPipeline(client).run_metadata(snapshot, auto_apply=True)
+
+        self.assertEqual(result.proposed_snapshot.tables["p1_t1"].metadata_row_ids, [])
+        self.assertFalse(result.decisions[0].valid)
+
+    def test_headers_create_logical_table_and_preserve_header(self):
+        snapshot = make_snapshot([["Report", ""], ["Name", "Age"], ["Bob", "20"], ["Sue", "30"]])
+        record = decision(
+            "headers",
+            "p1_t1",
+            "accept_header",
+            0.95,
+            "header",
+            {"header_groups": [["p1_t1_r2"]]},
+            True,
+            [],
+            "prompt_1",
+        )
+
+        result = apply_headers(snapshot, [record])
+
+        self.assertIn("p1_t1_h1", result.tables)
+        self.assertEqual(result.tables["p1_t1_h1"].header_row_ids, ["p1_t1_r2"])
+        self.assertEqual(result.tables["p1_t1_h1"].column_names["p1_t1_c1"], "Name")
+        self.assertEqual(
+            normalize_header_groups(
+                ["r1", "r2", "r3", "r4"],
+                [["r2", "r3"], ["r3"], ["r4"]],
+            ),
+            [["r2", "r3", "r4"]],
+        )
+
+    def test_invalid_header_groups_do_not_partially_mutate_snapshot(self):
+        snapshot = make_snapshot([["Name", "Age"], ["Bob", "20"]])
+        record = decision(
+            "headers",
+            "p1_t1",
+            "accept_header",
+            1.0,
+            "header",
+            {"header_groups": [["p1_t1_r1"], ["unknown_row"]]},
+            True,
+            [],
+            "prompt_1",
+        )
+
+        result = apply_headers(snapshot, [record])
+
+        self.assertFalse(record.valid)
+        self.assertEqual(result.tables["p1_t1"].row_ids, ["p1_t1_r1", "p1_t1_r2"])
+        self.assertEqual(result.rows["p1_t1_r1"].role, "data")
+
+    def test_column_split_validates_full_column_and_rebases_issues(self):
+        snapshot = make_snapshot([["Bob 20"], ["Sue 30"]], column_names=("Name Age",))
+        issue = IssueState(
+            issue_id="merged",
+            source_issue_id="merged",
+            issue_type="possible_merged_column",
+            severity="warning",
+            table_id="p1_t1",
+            affected_cell_ids=["p1_t1_r1::p1_t1_c1", "p1_t1_r2::p1_t1_c1"],
+            status="active",
+            explanation="merged",
+            suggested_action="split",
+        )
+        snapshot.issues["merged"] = issue
+        for cell_id in issue.affected_cell_ids:
+            snapshot.cells[cell_id].warning_ids.append("merged")
+        client = MockClient([{
+            "action": "split",
+            "confidence": 0.95,
+            "reason": "two stable fields",
+            "regex": r"(?P<name>[A-Za-z]+) (?P<age>\d+)",
+            "new_headers": ["Name", "Age"],
+            "expected": {"Bob 20": ["Bob", "20"], "Sue 30": ["Sue", "30"]},
+        }])
+
+        result = TableFixerPipeline(client).run_columns(snapshot)
+        proposed = result.proposed_snapshot
+
+        self.assertEqual(len(proposed.tables["p1_t1"].column_ids), 2)
+        self.assertEqual(proposed.issues["merged"].status, "superseded")
+        self.assertTrue(any(issue.ancestor_issue_ids == ["merged"] for issue in proposed.issues.values()))
+
+    def test_column_regex_repair_is_limited_to_two_calls(self):
+        snapshot = make_snapshot([["Bob 20"], ["Sue 30"]], column_names=("Name Age",))
+        affected = ["p1_t1_r1::p1_t1_c1", "p1_t1_r2::p1_t1_c1"]
+        snapshot.issues["merged"] = IssueState(
+            "merged", "merged", "possible_merged_column", "warning", "p1_t1",
+            affected, "active", "merged", "split",
+        )
+        invalid = {
+            "action": "split",
+            "confidence": 0.95,
+            "reason": "split",
+            "regex": "(",
+            "new_headers": ["Name", "Age"],
+            "expected": {},
+        }
+        client = MockClient([invalid, invalid, invalid])
+
+        result = TableFixerPipeline(client).run_columns(snapshot)
+
+        self.assertEqual(len(client.calls), 3)
+        self.assertFalse(result.decisions[0].valid)
+        self.assertEqual(len(result.proposed_snapshot.tables["p1_t1"].column_ids), 1)
+
+    def test_phase_four_excludes_info_and_resolves_warning(self):
+        snapshot = make_snapshot([["Bob", "20"]])
+        warning_cell = "p1_t1_r1::p1_t1_c1"
+        snapshot.issues["warn"] = IssueState(
+            "warn", "warn", "ambiguous_column_assignment", "warning", "p1_t1",
+            [warning_cell], "active", "warning", "review",
+        )
+        snapshot.issues["info"] = IssueState(
+            "info", "info", "low_ocr_confidence", "info", "p1_t1",
+            [warning_cell], "active", "info", "review",
+        )
+        client = MockClient([{
+            "decisions": [{
+                "issue_id": "warn",
+                "action": "no_issue",
+                "confidence": 0.9,
+                "reason": "placement is coherent",
+                "payload": {},
+            }]
+        }])
+
+        result = TableFixerPipeline(client).run_warnings(snapshot)
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(result.proposed_snapshot.issues["warn"].status, "dismissed")
+        self.assertEqual(result.proposed_snapshot.issues["info"].status, "active")
+
+    def test_phase_four_auto_apply_never_mutates_cells(self):
+        snapshot = make_snapshot([["Bob", "20"]])
+        source_cell = "p1_t1_r1::p1_t1_c1"
+        target_cell = "p1_t1_r1::p1_t1_c2"
+        snapshot.issues["warn"] = IssueState(
+            "warn", "warn", "ambiguous_column_assignment", "warning", "p1_t1",
+            [source_cell], "active", "warning", "review",
+        )
+        client = MockClient([{
+            "decisions": [{
+                "issue_id": "warn",
+                "action": "move_cell",
+                "confidence": 1.0,
+                "reason": "move",
+                "payload": {"source_cell_id": source_cell, "target_cell_id": target_cell},
+            }]
+        }])
+
+        result = TableFixerPipeline(client).run_warnings(snapshot, auto_apply=True)
+
+        self.assertFalse(result.decisions[0].valid)
+        self.assertTrue(any(
+            "Move target must be empty" in error
+            for error in result.decisions[0].validation_errors
+        ))
+        self.assertEqual(result.proposed_snapshot.cells[source_cell].text, "Bob")
+        self.assertEqual(result.proposed_snapshot.cells[target_cell].text, "20")
+        self.assertEqual(result.proposed_snapshot.issues["warn"].status, "active")
+
+    def test_warning_context_overflow_creates_multiple_batches(self):
+        snapshot = make_snapshot([[f"row {index}", str(index)] for index in range(8)])
+        for index in range(1, 9):
+            issue_id = f"warn_{index}"
+            cell_id = f"p1_t1_r{index}::p1_t1_c1"
+            snapshot.issues[issue_id] = IssueState(
+                issue_id, issue_id, "ambiguous_column_assignment", "warning", "p1_t1",
+                [cell_id], "active", "warning " * 30, "review",
+            )
+        responses = [
+            {"decisions": []},
+            {"decisions": []},
+            {"decisions": []},
+            {"decisions": []},
+            {"decisions": []},
+            {"decisions": []},
+            {"decisions": []},
+            {"decisions": []},
+        ]
+        client = MockClient(responses)
+
+        TableFixerPipeline(client, context_token_budget=80).run_warnings(snapshot)
+
+        self.assertGreater(len(client.calls), 1)
+        supplied = sum(len(call["context"]["warnings"]) for call in client.calls)
+        self.assertEqual(supplied, 8)
+
+
+if __name__ == "__main__":
+    unittest.main()

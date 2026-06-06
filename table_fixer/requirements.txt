@@ -1,0 +1,8 @@
+streamlit
+PyMuPDF
+rapidocr-onnxruntime
+Pillow
+numpy
+pandas
+openpyxl
+tiktoken

@@ -9,7 +9,7 @@ def box(text, x0, y0, x1, y1, confidence=0.99):
 
 
 class ExtractionDiagnosticsTests(unittest.TestCase):
-    def test_shifted_layout_region_becomes_separate_table(self):
+    def test_shifted_layout_region_stays_in_source_table_with_warning(self):
         items = [
             box("A1", 10, 10, 30, 20), box("B1", 110, 10, 130, 20),
             box("A2", 10, 25, 30, 35), box("B2", 110, 25, 130, 35),
@@ -19,7 +19,7 @@ class ExtractionDiagnosticsTests(unittest.TestCase):
 
         result = extract_table_scanned(items, 300)
 
-        self.assertEqual(result["row_table_indexes"], [1, 1, 2, 2])
+        self.assertEqual(result["row_table_indexes"], [1, 1, 1, 1])
         self.assertIn("incompatible_layout_regions", {issue["issue_type"] for issue in result["issues"]})
 
     def test_weak_single_row_boundary_is_ignored_and_explained(self):
@@ -56,6 +56,25 @@ class ExtractionDiagnosticsTests(unittest.TestCase):
         self.assertEqual(len(result["aligned_rows"][0]), 1)
         self.assertEqual(result["aligned_rows"][0][0], "left right")
         self.assertIn("possible_cell_collision", {issue["issue_type"] for issue in result["issues"]})
+
+    def test_repeated_collisions_warn_about_entire_merged_column(self):
+        result = extract_table_scanned(
+            [
+                box("left1", 10, 10, 50, 20), box("right1", 75, 10, 115, 20),
+                box("left2", 10, 25, 90, 35), box("right2", 115, 25, 155, 35),
+            ],
+            180,
+        )
+
+        merged_column_issue = next(
+            issue for issue in result["issues"] if issue["issue_type"] == "possible_merged_column"
+        )
+        self.assertEqual(merged_column_issue["col_index"], 1)
+        self.assertEqual(merged_column_issue["evidence"]["affected_rows"], [1, 2])
+        self.assertEqual(merged_column_issue["evidence"]["support_count"], 2)
+        self.assertIsNotNone(merged_column_issue["evidence"]["estimated_split_x"])
+        affected_cells = [cell for cell in result["cells"] if cell["row_index"] in {1, 2}]
+        self.assertTrue(all(merged_column_issue["issue_id"] in cell["issue_ids"] for cell in affected_cells))
 
     def test_ambiguous_row_and_low_ocr_are_explained(self):
         items = [
