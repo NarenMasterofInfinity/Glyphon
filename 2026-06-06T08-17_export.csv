@@ -1,0 +1,60 @@
+﻿,page_number,row_number,col_1,col_2,col_3,col_4,col_5,col_6
+0,1,1,Design and build,,,,,
+1,1,2,accessible PDF tables,,,,,
+2,1,3,Sample tables,,,,,
+3,1,4,Table 1,,,,,
+4,1,5,Column header (TH),Column header (TH),Column header (TH),,,
+5,1,6,Row header (TH),Data cell (TD),Data cell (TD),,,
+6,1,7,Row header(TH),Data cell (TD),Data cell (TD),,,
+7,1,8,Table 2: example of footnotes referenced from within a table,,,,,
+8,1,9,Expenditure by function E million,2009/10,2010/11,,,
+9,1,10,Policy functions,,Financial,22.5,30.57,
+10,1,11,,,Information 2,10.2,14.8,
+11,1,12,,,Contingency,2.6,1.2,
+12,1,13,Remunerated functions,,Agency services,44.7,35.91,
+13,1,14,,,Payments,22.41,19.88,
+14,1,15,,,Banking,22.90,44.23,
+15,1,16,,,Other,12.69,10.32,
+16,1,17,(1) Provisional total as of publication date.,,,,,
+17,1,18,(2) Costs associated with on-going information programmes.,,,,,
+18,1,19,,"Table 3: ""film credits"" style layout",,,,
+19,1,20,Main character,Daniel Radcliffe,,,,
+20,1,21,Sidekick 1,Rupert Grint,,,,
+21,1,22,Sidekick 2,Emma Watson,,,,
+22,1,23,Lovable ogre,Robbie Coltrane,,,,
+23,1,24,Professor,Maggie Smith,,,,
+24,1,25,Headmaster,Richard Harris,,,,
+25,10,1,,,"Table 27: ""table"" with columns simulated by using tab stops",,,
+26,10,2,Name,,,,Apples,Pears
+27,10,3,Bob Scott,,,,20,25
+28,10,4,"Susan. P. Arnold-Jones, BA, FRSA, MD",,,,24,15
+29,10,5,Sam Holder-Dickinson,,,,14,10
+30,10,6,,"Table 28: year-end financial table (f, thousands) - headings problem",,,,
+31,10,7,revisited,,,,,
+32,10,8,,2010,2009,2008,,
+33,10,9,Non-current assets,,,,,
+34,10,10,Buildings,345,445,222,,
+35,10,11,Investment,567,654,423,,
+36,10,12,Intangibles,423,123,453,,
+37,10,13,Current assets,,,,,
+38,10,14,Trade,435,634,231,,
+39,10,15,Cash,524,123,482,,
+40,10,16,Other,223,211,254,,
+41,10,17,Current liabilities,,,,,
+42,10,18,Trade liabilities,154,125,421,,
+43,10,19,Financial debt,231,474,572,,
+44,10,20,Provisions,111,312,347,,
+45,11,1,,Table 29: multiple headers attributes for each data cell,,,,
+46,11,2,,South America,,Asia,Africa,Australia
+47,11,3,,2010,,,,
+48,11,4,Highest average,523.6,,467.4,405.0,340.5
+49,11,5,Highest in 24 hours,73.1,,54.1,27.2,66.3
+50,11,6,Highest in 12 hours,42.4,,30.1,15.9,40.3
+51,11,7,,2009,,,,
+52,11,8,Highest average,487.7,,453.6,398.7,356
+53,11,9,Highest in 24 hours,67.2,,53.2,44.3,53.8
+54,11,10,Highest in 12 hours,34.7,,34.1,29.8,31.0
+55,11,11,,2008,,,,
+56,11,12,Highest average,496.7,,444.3,502.1,399.6
+57,11,13,Highest in 24 hours,44.2,,56.7,32.1,63.2
+58,11,14,Highest in 12 hours,30.1,,32.7,21.9,40.2
