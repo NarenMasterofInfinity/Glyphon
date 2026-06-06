@@ -47,40 +47,16 @@ COLUMN_SPLIT_SCHEMA = {
     "required": ["action", "confidence", "reason", "regex", "new_headers", "expected"],
 }
 
-WARNING_BATCH_SCHEMA = {
+ROW_REPAIR_SCHEMA = {
     "type": "object",
     "properties": {
-        "decisions": {
-            "type": "array",
-            "maxItems": 12,
-            "items": {
-                "type": "object",
-                "properties": {
-                    "issue_id": {"type": "string"},
-                    "needs_correction": {"type": "boolean"},
-                    "correction_action": {
-                        "type": "string",
-                        "enum": [
-                            "none",
-                            "move_cell",
-                            "merge_adjacent_cells",
-                            "split_cell_text",
-                        ],
-                    },
-                    "confidence": CONFIDENCE,
-                    "reason": {"type": "string"},
-                    "payload": {"type": "object"},
-                },
-                "required": [
-                    "issue_id",
-                    "needs_correction",
-                    "correction_action",
-                    "confidence",
-                    "reason",
-                    "payload",
-                ],
-            },
-        }
+        "needs_correction": {"type": "boolean"},
+        "confidence": CONFIDENCE,
+        "reason": {"type": "string"},
+        "final_values": {
+            "type": "object",
+            "additionalProperties": {"type": "string"},
+        },
     },
-    "required": ["decisions"],
+    "required": ["needs_correction", "confidence", "reason", "final_values"],
 }

@@ -5,7 +5,7 @@ import re
 from statistics import mean, median
 from typing import Any
 
-from .models import CellState, LogicalTable, PipelineSnapshot, RowProfile
+from .models import CellState, IssueState, LogicalTable, PipelineSnapshot, RowProfile
 from .token_counting import TokenCounter
 
 
@@ -381,79 +381,184 @@ def column_split_context(snapshot: PipelineSnapshot, issue_id: str, sample_limit
         if len(distinct) >= sample_limit:
             break
     return {
-        "issue_id": issue_id,
-        "table_id": table.table_id,
-        "column_id": column_id,
-        "header": table.column_names.get(column_id, column_id),
-        "neighbor_headers": [
+        "task": (
+            "Decide whether this single column consistently contains multiple fields. "
+            "If it does, return a Python full-match regex with 2-4 named groups. "
+            "The group names should be short field names and every sample must match."
+        ),
+        "current_header": table.column_names.get(column_id, column_id),
+        "nearby_headers": [
             table.column_names[column]
             for column in table.column_ids
             if abs(table.column_ids.index(column) - table.column_ids.index(column_id)) <= 1
         ],
-        "evidence": issue.evidence,
-        "samples": [
-            {"cell_id": cell.cell_id, "text": cell.text, "bbox": normalized_bbox(snapshot, table, cell)}
-            for cell in distinct
-        ],
+        "why_flagged": issue.explanation,
+        "sample_values": [cell.text for cell in distinct],
+        "_table_id": table.table_id,
+        "_column_id": column_id,
     }
 
 
 def warning_context(snapshot: PipelineSnapshot, issue_id: str) -> dict[str, Any]:
     issue = snapshot.issues[issue_id]
-    table = snapshot.tables.get(issue.table_id) if issue.table_id else None
-    target_cells = [snapshot.cells[cell_id] for cell_id in issue.affected_cell_ids if cell_id in snapshot.cells]
-    nearby_ids: set[str] = set(issue.affected_cell_ids)
-    if table:
-        for target in target_cells:
-            row_index = table.row_ids.index(target.row_id) if target.row_id in table.row_ids else -1
-            col_index = table.column_ids.index(target.column_id)
-            for ri in range(max(0, row_index - 1), min(len(table.row_ids), row_index + 2)):
-                for ci in range(max(0, col_index - 1), min(len(table.column_ids), col_index + 2)):
-                    cell_id = f"{table.row_ids[ri]}::{table.column_ids[ci]}"
-                    if cell_id in snapshot.cells:
-                        nearby_ids.add(cell_id)
-    relevant_column_ids = []
-    if table:
-        target_column_ids = {
-            cell.column_id for cell in target_cells if cell.column_id in table.column_ids
-        }
-        for column_id in table.column_ids:
-            if any(
-                abs(table.column_ids.index(column_id) - table.column_ids.index(target_column_id)) <= 1
-                for target_column_id in target_column_ids
-            ):
-                relevant_column_ids.append(column_id)
+    cell_id = next((value for value in issue.affected_cell_ids if value in snapshot.cells), "")
+    return cell_warning_context(snapshot, cell_id, [issue])
+
+
+def cell_warning_context(
+    snapshot: PipelineSnapshot,
+    cell_id: str,
+    issues: list[IssueState],
+) -> dict[str, Any]:
+    source = snapshot.cells[cell_id]
+    table_id = snapshot.rows[source.row_id].table_id
+    table = snapshot.tables[table_id]
+    source_index = table.column_ids.index(source.column_id)
+    row_index = table.row_ids.index(source.row_id)
+
+    def header(column_id: str) -> str:
+        return table.column_names.get(column_id, column_id)
+
+    relevant_column_ids = [
+        column_id
+        for index, column_id in enumerate(table.column_ids)
+        if abs(index - source_index) <= 1
+    ]
     return {
-        "issue": issue.__dict__,
-        "relevant_headers": (
-            [
-                {
-                    "column_id": column_id,
-                    "name": table.column_names.get(column_id, column_id),
-                    "header_values": [
-                        snapshot.cells[cell_id].text
-                        for row_id in table.header_row_ids
-                        if (cell_id := f"{row_id}::{column_id}") in snapshot.cells
-                        and snapshot.cells[cell_id].text.strip()
-                    ],
-                }
-                for column_id in relevant_column_ids
-            ]
-            if table else []
-        ),
-        "cells": [
+        "cell_id": cell_id,
+        "issue_ids": [issue.issue_id for issue in issues],
+        "source": {
+            "cell_id": cell_id,
+            "text": source.text,
+            "header": header(source.column_id),
+            "header_is_placeholder": header(source.column_id).startswith("col_"),
+            "source_item_count": len(source.source_item_indexes),
+        },
+        "issues": [
             {
-                "cell_id": cell.cell_id,
-                "text": cell.text,
-                "bbox": normalized_bbox(snapshot, table, cell) if table else None,
-                "warnings": cell.warning_ids,
-                "confidence": cell.assignment_score,
-                "alternatives": cell.alternatives[:2],
-                "ancestors": cell.ancestor_cell_ids,
+                "issue_id": issue.issue_id,
+                "type": issue.issue_type,
+                "severity": issue.severity,
+                "explanation": issue.explanation,
             }
-            for cell_id in sorted(nearby_ids)
-            if (cell := snapshot.cells.get(cell_id))
+            for issue in issues
         ],
+        "relevant_headers": [
+            {
+                "column_id": column_id,
+                "name": header(column_id),
+                "is_placeholder": header(column_id).startswith("col_"),
+            }
+            for column_id in relevant_column_ids
+        ],
+        "row_destinations": [
+            {
+                "cell_id": destination_id,
+                "header": header(column_id),
+                "header_is_placeholder": header(column_id).startswith("col_"),
+                "current_text": snapshot.cells[destination_id].text,
+                "distance_from_source": abs(index - source_index),
+                "nearby_values": [
+                    snapshot.cells[example_id].text
+                    for nearby_row_id in table.row_ids[max(0, row_index - 2):row_index + 3]
+                    if nearby_row_id != source.row_id
+                    and (example_id := f"{nearby_row_id}::{column_id}") in snapshot.cells
+                    and snapshot.cells[example_id].text.strip()
+                ][:3],
+            }
+            for index, column_id in enumerate(table.column_ids)
+            if (destination_id := f"{source.row_id}::{column_id}") in snapshot.cells
+        ],
+        "assignment_alternatives": [
+            {
+                "header": header(table.column_ids[int(alternative["col_index"]) - 1]),
+                "score": alternative.get("score"),
+            }
+            for alternative in source.alternatives[:3]
+            if isinstance(alternative, dict)
+            and isinstance(alternative.get("col_index"), int)
+            and 0 < alternative["col_index"] <= len(table.column_ids)
+        ],
+    }
+
+
+def row_repair_context(
+    snapshot: PipelineSnapshot,
+    row_id: str,
+    issues: list[IssueState],
+) -> dict[str, Any]:
+    table = snapshot.tables[snapshot.rows[row_id].table_id]
+    named_headers: set[str] = set()
+    affected_column_ids: set[str] = set()
+    for issue in issues:
+        expected = issue.evidence.get("expected_header")
+        if isinstance(expected, str):
+            named_headers.add(expected)
+        named_headers.update(
+            value for value in issue.evidence.get("expected_headers", [])
+            if isinstance(value, str)
+        )
+        for cell_id in issue.affected_cell_ids:
+            if cell_id in snapshot.cells and snapshot.cells[cell_id].row_id == row_id:
+                affected_column_ids.add(snapshot.cells[cell_id].column_id)
+
+    repair_column_ids = [
+        column_id
+        for column_id in table.column_ids
+        if column_id in affected_column_ids
+        or table.column_names.get(column_id, column_id) in named_headers
+    ]
+    if not named_headers:
+        affected_indexes = [
+            table.column_ids.index(column_id)
+            for column_id in affected_column_ids
+        ]
+        repair_column_ids = [
+            column_id
+            for index, column_id in enumerate(table.column_ids)
+            if any(abs(index - affected_index) <= 1 for affected_index in affected_indexes)
+            or (
+                any(abs(index - affected_index) <= 2 for affected_index in affected_indexes)
+                and not snapshot.cells[f"{row_id}::{column_id}"].text.strip()
+            )
+        ]
+
+    columns = []
+    row_index = table.row_ids.index(row_id)
+    for column_id in repair_column_ids:
+        header = table.column_names.get(column_id, column_id)
+        cell_id = f"{row_id}::{column_id}"
+        columns.append({
+            "header": header,
+            "current_text": snapshot.cells[cell_id].text if cell_id in snapshot.cells else "",
+            "examples_only_do_not_copy": [
+                snapshot.cells[example_id].text
+                for nearby_row_id in table.row_ids[max(0, row_index - 2):row_index + 3]
+                if nearby_row_id != row_id
+                and (example_id := f"{nearby_row_id}::{column_id}") in snapshot.cells
+                and snapshot.cells[example_id].text.strip()
+            ][:3],
+        })
+    return {
+        "task": (
+            "Repair only the listed columns in this one row. Arrange the available_parts under the correct headers. "
+            "You may combine adjacent parts into one value. Nearby examples show column meaning only and must never "
+            "be copied. Return final_values for every non-empty final value. Use every available part exactly once. "
+            "Do not calculate or invent values."
+        ),
+        "problem": " ".join(dict.fromkeys(issue.explanation for issue in issues)),
+        "available_parts": [
+            part
+            for column in columns
+            for part in column["current_text"].split()
+        ],
+        "columns": columns,
+        "_row_id": row_id,
+        "_issue_ids": [issue.issue_id for issue in issues],
+        "_column_ids_by_header": {
+            table.column_names.get(column_id, column_id): column_id
+            for column_id in repair_column_ids
+        },
     }
 
 

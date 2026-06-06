@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import replace
 from typing import Any
 from uuid import uuid4
@@ -325,12 +326,6 @@ def validate_split_regex(
         errors.append("Regex must contain 2-4 named capture groups and no unnamed groups.")
     if len(new_headers) != len(group_names):
         errors.append("New header count must match named capture group count.")
-    source_words = set(re.findall(r"[a-z0-9]+", source_header.lower()))
-    if source_words and any(
-        not set(re.findall(r"[a-z0-9]+", header.lower())).issubset(source_words)
-        for header in new_headers
-    ):
-        errors.append("New headers must use words from the existing merged header.")
     for value in values:
         match = compiled.fullmatch(value)
         if not match:
@@ -344,6 +339,28 @@ def validate_split_regex(
         if source in actual and actual[source] != expected_groups:
             errors.append(f"Expected-output mismatch for value: {source}")
     return compiled, sorted(set(errors)), actual
+
+
+def infer_whitespace_split(
+    source_header: str,
+    values: list[str],
+) -> tuple[str, list[str]] | None:
+    parts = [value.split() for value in values]
+    counts = {len(value_parts) for value_parts in parts}
+    if len(counts) != 1:
+        return None
+    count = next(iter(counts), 0)
+    if not 2 <= count <= 4:
+        return None
+    header_parts = re.findall(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|\d+", source_header)
+    if len(header_parts) != count:
+        header_parts = [f"Field {index}" for index in range(1, count + 1)]
+    group_names = [
+        re.sub(r"[^a-z0-9]+", "_", header.lower()).strip("_") or f"field_{index}"
+        for index, header in enumerate(header_parts, start=1)
+    ]
+    pattern = r"\s+".join(f"(?P<{name}>\\S+)" for name in group_names)
+    return pattern, header_parts
 
 
 def apply_column_split(
@@ -365,6 +382,15 @@ def apply_column_split(
     table.column_names.update(dict(zip(new_column_ids, new_headers)))
     result.column_lineage[old_column_id] = new_column_ids
     affected: list[str] = []
+    trigger_issue = result.issues.get(record.target_id)
+    if trigger_issue:
+        trigger_issue.status = "resolved"
+        for cell_id in trigger_issue.affected_cell_ids:
+            if cell_id in result.cells:
+                result.cells[cell_id].warning_ids = [
+                    issue_id for issue_id in result.cells[cell_id].warning_ids
+                    if issue_id != trigger_issue.issue_id
+                ]
 
     for row_id in table.row_ids + table.header_row_ids:
         old_cell_id = f"{row_id}::{old_column_id}"
@@ -446,8 +472,53 @@ def validate_warning_action(snapshot: PipelineSnapshot, record: DecisionRecord) 
     payload = record.payload
     if action == "no_issue":
         return errors
-    if action not in {"move_cell", "merge_adjacent_cells", "split_cell_text"}:
+    if action not in {"move_cell", "merge_adjacent_cells", "split_cell_text", "redistribute_cell", "redistribute_row"}:
         return ["Correction decision does not contain an allowed executable action."]
+    if action == "redistribute_row":
+        source_ids = payload.get("source_cell_ids")
+        assignments = payload.get("assignments")
+        if not isinstance(source_ids, list) or not source_ids:
+            return ["redistribute_row requires source cells."]
+        if not isinstance(assignments, list) or not assignments:
+            return ["redistribute_row requires final assignments."]
+        if any(source_id not in snapshot.cells for source_id in source_ids):
+            return ["Every row-repair source must be an existing cell."]
+        source_rows = {snapshot.cells[source_id].row_id for source_id in source_ids}
+        if len(source_rows) != 1:
+            errors.append("Row repair sources must belong to one row.")
+        source_id_set = set(source_ids)
+        target_ids: list[str] = []
+        assigned_text: list[str] = []
+        for assignment in assignments:
+            target_id = assignment.get("target_cell_id") if isinstance(assignment, dict) else None
+            text = assignment.get("text") if isinstance(assignment, dict) else None
+            if target_id not in source_id_set:
+                errors.append("Every row-repair target must be inside the supplied repair zone.")
+                continue
+            if not isinstance(text, str) or not text.strip():
+                errors.append("Every row-repair assignment requires non-empty text.")
+                continue
+            target_ids.append(target_id)
+            assigned_text.append(text)
+        if len(target_ids) != len(set(target_ids)):
+            errors.append("Row repair cannot assign multiple values to the same target.")
+        tokens = lambda value: Counter(re.findall(r"\w+|[^\w\s]", value.lower()))
+        source_text = " ".join(snapshot.cells[source_id].text for source_id in source_ids)
+        if tokens(source_text) != tokens(" ".join(assigned_text)):
+            errors.append("Row repair must preserve every source token exactly once.")
+        current = {
+            source_id: snapshot.cells[source_id].text.strip()
+            for source_id in source_ids
+            if snapshot.cells[source_id].text.strip()
+        }
+        proposed = {
+            target_id: text.strip()
+            for target_id, text in zip(target_ids, assigned_text)
+            if text.strip()
+        }
+        if current == proposed:
+            errors.append("Row repair must change at least one listed column.")
+        return errors
     source_id = payload.get("source_cell_id")
     target_id = payload.get("target_cell_id")
     if source_id not in snapshot.cells:
@@ -480,6 +551,37 @@ def validate_warning_action(snapshot: PipelineSnapshot, record: DecisionRecord) 
             errors.append("split_cell_text requires a replacement new_text and cannot create columns.")
         elif new_text == snapshot.cells[source_id].text:
             errors.append("split_cell_text replacement must differ from the current cell text.")
+    if action == "redistribute_cell":
+        assignments = payload.get("assignments")
+        if not isinstance(assignments, list) or not assignments:
+            return errors + ["redistribute_cell requires at least one assignment."]
+        source = snapshot.cells[source_id]
+        source_table = snapshot.rows[source.row_id].table_id
+        target_ids: list[str] = []
+        assigned_text: list[str] = []
+        for assignment in assignments:
+            target_id = assignment.get("target_cell_id") if isinstance(assignment, dict) else None
+            text = assignment.get("text") if isinstance(assignment, dict) else None
+            if target_id not in snapshot.cells:
+                errors.append("Every redistribution target must be an existing cell.")
+                continue
+            target = snapshot.cells[target_id]
+            if snapshot.rows[target.row_id].table_id != source_table or target.row_id != source.row_id:
+                errors.append("Redistribution targets must be in the source row and logical table.")
+            if target_id != source_id and target.text.strip():
+                errors.append("Redistribution targets must be empty unless the target is the source cell.")
+            if not isinstance(text, str) or not text.strip():
+                errors.append("Every redistribution assignment requires non-empty text.")
+                continue
+            target_ids.append(target_id)
+            assigned_text.append(text)
+        if len(target_ids) != len(set(target_ids)):
+            errors.append("Redistribution cannot assign multiple values to the same target cell.")
+        tokens = lambda value: Counter(re.findall(r"\w+|[^\w\s]", value.lower()))
+        if tokens(source.text) != tokens(" ".join(assigned_text)):
+            errors.append("Redistribution must preserve every source token exactly once.")
+        if len(assignments) == 1 and target_ids == [source_id] and assigned_text == [source.text]:
+            errors.append("Redistribution must change the cell placement or contents.")
     return errors
 
 
@@ -487,27 +589,50 @@ def apply_warning_decisions(snapshot: PipelineSnapshot, records: list[DecisionRe
     result = snapshot.clone(f"snapshot_warnings_{uuid4().hex[:8]}", "warnings")
     for record in records:
         result.decisions.append(record)
-        issue = result.issues.get(record.target_id)
-        if not issue or not record.valid:
+        issue_ids = record.payload.get("issue_ids", [record.target_id])
+        issues = [result.issues[issue_id] for issue_id in issue_ids if issue_id in result.issues]
+        if not issues or not record.valid:
             continue
         if record.action == "no_issue":
-            issue.status = "dismissed"
+            for issue in issues:
+                issue.status = "dismissed"
         elif record.action == "move_cell":
             source = result.cells[record.payload["source_cell_id"]]
             target = result.cells[record.payload["target_cell_id"]]
             target.text = f"{target.text} {source.text}".strip()
             source.text = ""
-            issue.status = "resolved"
+            for issue in issues:
+                issue.status = "resolved"
         elif record.action == "merge_adjacent_cells":
             source = result.cells[record.payload["source_cell_id"]]
             target = result.cells[record.payload["target_cell_id"]]
             target.text = f"{target.text} {source.text}".strip()
             target.ancestor_cell_ids.append(source.cell_id)
             source.text = ""
-            issue.status = "resolved"
+            for issue in issues:
+                issue.status = "resolved"
         elif record.action == "split_cell_text":
             result.cells[record.payload["source_cell_id"]].text = record.payload["new_text"]
-            issue.status = "resolved"
+            for issue in issues:
+                issue.status = "resolved"
+        elif record.action == "redistribute_cell":
+            source = result.cells[record.payload["source_cell_id"]]
+            source.text = ""
+            for assignment in record.payload["assignments"]:
+                result.cells[assignment["target_cell_id"]].text = assignment["text"].strip()
+            for issue in issues:
+                issue.status = "resolved"
+        elif record.action == "redistribute_row":
+            for source_id in record.payload["source_cell_ids"]:
+                result.cells[source_id].text = ""
+            for assignment in record.payload["assignments"]:
+                result.cells[assignment["target_cell_id"]].text = assignment["text"].strip()
+            for issue in issues:
+                issue.status = "resolved"
         record.applied = True
-        record.affected_ids = list(issue.affected_cell_ids)
+        record.affected_ids = list(dict.fromkeys(
+            cell_id
+            for issue in issues
+            for cell_id in issue.affected_cell_ids
+        ))
     return result

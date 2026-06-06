@@ -1,0 +1,158 @@
+{
+  "columns": [
+    "InvoiceDate",
+    "Customer",
+    "Item Code",
+    "Item Name",
+    "Qty",
+    "Unit Price",
+    "Tax %",
+    "Total"
+  ],
+  "rows": [
+    ["INV-001 2026-06-01", "Aarav Traders", "P1001", "Face Wash", "10", "180", "18", "2124"],
+    ["INV-002 2026-06-01", "Meera Stores", "P1002 Sunscreen SPF50", "", "5", "450", "18", "2655"],
+    ["INV-003 2026-06-02", "Kavin Mart", "P1003", "Vitamin C Serum 30ml", "3 799", "18", "", "2828.46"],
+    ["INV-004 2026-06-02", "Riya Pharmacy", "P1004", "Moisturizer", "12", "250 18", "", "3540"],
+    ["INV-005 2026-06-03", "Anika Wellness", "P1005", "Anti Acne Gel", "6", "320", "18", "2265.6"],
+    ["INV-006 2026-06-03", "Dev Medicals", "P1006", "Hair Growth Serum", "2", "1200", "18", "2832"],
+    ["INV-007 2026-06-04", "Nila Beauty", "P1007", "Clay Mask", "8", "", "18", "1888"],
+    ["INV-008 2026-06-04", "Om Skin Care", "", "P1008 Toner 200ml", "4", "300", "18", "1416"],
+    ["INV-009 2026-06-05", "Vetri Pharma", "P1009", "Lip Balm", "20", "90", "18 2124", ""],
+    ["INV-010 2026-06-05", "Sara Cosmetics", "P1010", "Night Cream", "7", "650", "18", "5369"],
+    ["INV-011 2026-06-06", "Arun Stores", "P1011", "Under Eye Gel", "9", "400", "18", "4248"],
+    ["INV-012 2026-06-06", "Leela Medicals", "P1012", "Body Lotion", "15", "220", "18", "3894"],
+    ["INV-013 2026-06-07", "Fresh Skin Co", "P1013", "Hand Cream", "10", "150", "18", "1770"],
+    ["INV-014 2026-06-07", "Urban Glow", "P1014", "Retinol Serum", "4", "950", "18", "4484"],
+    ["INV-015 2026-06-08", "Pixel Pharmacy", "P1015", "Shampoo 250ml", "11", "280", "18", "3634.4"],
+    ["INV-016 2026-06-08", "Green Leaf", "P1016 Conditioner 250ml", "", "11", "260", "18", "3374.8"],
+    ["INV-017 2026-06-09", "Glow Mart", "P1017", "Face Scrub", "6", "210", "1260", "18"],
+    ["INV-018 2026-06-09", "Bluebell Stores", "P1018", "Day Cream", "5", "500", "18", "2950"],
+    ["INV-019 2026-06-10", "Nova Pharmacy", "P1019", "Cleanser", "13", "175", "18", "2684.5"],
+    ["INV-020 2026-06-10", "Lotus Wellness", "P1020", "Spot Corrector", "2", "875", "18", "2065"]
+  ],
+  "column_issues": [
+    {
+      "issue_id": "invoice_date_merged_column",
+      "column": 1,
+      "issue_type": "possible_merged_column",
+      "severity": "warning",
+      "row_indexes": [1, 2, 3, 4, 5, 6, 7, 8],
+      "explanation": "Invoice number and invoice date appear merged in the InvoiceDate column.",
+      "suggested_action": "Split invoice identifier and date into separate columns if the pattern is consistent.",
+      "evidence": {
+        "affected_rows": [1, 2, 3, 4, 5, 6, 7, 8]
+      }
+    }
+  ],
+  "cell_issues": [
+    {
+      "issue_id": "r2_item_code_name_merged",
+      "row": 2,
+      "column": 3,
+      "issue_type": "item_crosses_boundary",
+      "severity": "warning",
+      "explanation": "Item code and item name appear merged in one cell.",
+      "suggested_action": "Split the merged text across Item Code and Item Name.",
+      "evidence": {
+        "expected_headers": ["Item Code", "Item Name"]
+      }
+    },
+    {
+      "issue_id": "r2_item_code_assignment",
+      "row": 2,
+      "column": 3,
+      "issue_type": "ambiguous_column_assignment",
+      "severity": "warning",
+      "explanation": "Expected header: Item Code",
+      "suggested_action": "Keep the product code in Item Code and move the description to Item Name.",
+      "evidence": {
+        "expected_header": "Item Code"
+      }
+    },
+    {
+      "issue_id": "r3_qty_price_merged",
+      "row": 3,
+      "column": 5,
+      "issue_type": "item_crosses_boundary",
+      "severity": "warning",
+      "explanation": "Quantity and unit price appear merged in Qty.",
+      "suggested_action": "Split the quantity and unit price.",
+      "evidence": {
+        "expected_headers": ["Qty", "Unit Price"]
+      }
+    },
+    {
+      "issue_id": "r3_tax_shifted",
+      "row": 3,
+      "column": 6,
+      "issue_type": "ambiguous_column_assignment",
+      "severity": "warning",
+      "explanation": "Expected header: Tax %",
+      "suggested_action": "Move the tax value out of Unit Price into Tax %.",
+      "evidence": {
+        "expected_header": "Tax %"
+      }
+    },
+    {
+      "issue_id": "r4_price_tax_merged",
+      "row": 4,
+      "column": 6,
+      "issue_type": "item_crosses_boundary",
+      "severity": "warning",
+      "explanation": "Unit price and tax appear merged in Unit Price.",
+      "suggested_action": "Split the value across Unit Price and Tax %.",
+      "evidence": {
+        "expected_headers": ["Unit Price", "Tax %"]
+      }
+    },
+    {
+      "issue_id": "r8_code_name_shifted",
+      "row": 8,
+      "column": 4,
+      "issue_type": "item_crosses_boundary",
+      "severity": "warning",
+      "explanation": "Item code and item name appear merged in Item Name.",
+      "suggested_action": "Move the product code into Item Code and keep the description in Item Name.",
+      "evidence": {
+        "expected_headers": ["Item Code", "Item Name"]
+      }
+    },
+    {
+      "issue_id": "r9_tax_total_merged",
+      "row": 9,
+      "column": 7,
+      "issue_type": "item_crosses_boundary",
+      "severity": "warning",
+      "explanation": "Tax percent and total appear merged in Tax %.",
+      "suggested_action": "Split the value across Tax % and Total.",
+      "evidence": {
+        "expected_headers": ["Tax %", "Total"]
+      }
+    },
+    {
+      "issue_id": "r16_code_name_merged",
+      "row": 16,
+      "column": 3,
+      "issue_type": "item_crosses_boundary",
+      "severity": "warning",
+      "explanation": "Item code and item name appear merged in one cell.",
+      "suggested_action": "Split the merged text across Item Code and Item Name.",
+      "evidence": {
+        "expected_headers": ["Item Code", "Item Name"]
+      }
+    },
+    {
+      "issue_id": "r17_tax_total_swapped",
+      "row": 17,
+      "column": 7,
+      "issue_type": "ambiguous_column_assignment",
+      "severity": "warning",
+      "explanation": "Expected header: Total",
+      "suggested_action": "Move the subtotal-like value into Total if the row can be normalized safely.",
+      "evidence": {
+        "expected_header": "Total"
+      }
+    }
+  ]
+}

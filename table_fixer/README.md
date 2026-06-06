@@ -22,3 +22,12 @@ snapshots, LLM responses, decisions, token usage, preserved metadata/headers, an
 Structural auto-apply defaults to a conservative `0.95` confidence threshold. Cell moves and other
 warning repairs are applied only after binary LLM decisions pass deterministic validation; occupied-target
 moves are rejected, and invalid metadata/header decisions cannot consume or partially mutate a table.
+
+Cell-level diagnostics are grouped into one small row-local repair task. Each prompt contains only the
+problem description, relevant headers, current text split into `available_parts`, and nearby examples that
+are explicitly context-only. The LLM returns a `final_values` header-to-text map. Code applies it atomically
+only when every original token is preserved exactly once and no new value was invented.
+
+Merged-column prompts handle one column at a time. If the LLM identifies a split but repeatedly produces
+an invalid regex, code can apply a conservative whitespace split only when every column value has the same
+2-4 part structure.

@@ -112,6 +112,59 @@ def show_decisions(run: PhaseRun) -> None:
             st.code(response.raw_response or "", language="json")
 
 
+def show_cell_repairs(before: PipelineSnapshot, after: PipelineSnapshot, run: PhaseRun) -> None:
+    records = []
+    for decision in run.decisions:
+        source_id = decision.payload.get("source_cell_id")
+        target_ids = [
+            value
+            for key, value in decision.payload.items()
+            if key.endswith("_cell_id") and isinstance(value, str)
+        ]
+        target_ids.extend(
+            assignment.get("target_cell_id")
+            for assignment in decision.payload.get("assignments", [])
+            if isinstance(assignment, dict)
+        )
+        for cell_id in dict.fromkeys([source_id, *target_ids]):
+            if not cell_id or cell_id not in before.cells:
+                continue
+            cell = before.cells[cell_id]
+            table_id = before.rows[cell.row_id].table_id
+            header = before.tables[table_id].column_names.get(cell.column_id, cell.column_id)
+            records.append({
+                "source_cell": source_id,
+                "cell": cell_id,
+                "header": header,
+                "before": cell.text,
+                "after": after.cells[cell_id].text if cell_id in after.cells else "",
+                "action": decision.action,
+                "issues": ", ".join(decision.payload.get("issue_ids", [decision.target_id])),
+                "valid": decision.valid,
+                "applied": decision.applied,
+                "reason": decision.reason,
+                "errors": "; ".join(decision.validation_errors),
+            })
+    if records:
+        st.dataframe(pd.DataFrame(records), use_container_width=True, height=360)
+    else:
+        st.info("No cell-level repair decisions were produced.")
+    resolved = sum(
+        issue.status in {"resolved", "dismissed"}
+        for issue in after.issues.values()
+        if issue.affected_cell_ids
+    )
+    remaining = sum(
+        issue.status == "active"
+        for issue in after.issues.values()
+        if issue.affected_cell_ids
+    )
+    metrics = st.columns(3)
+    metrics[0].metric("Cell decisions", len(run.decisions))
+    metrics[1].metric("Cell issues closed", resolved)
+    metrics[2].metric("Cell issues remaining", remaining)
+
+
 def build_pipeline(
     client: OllamaLLMClient,
     *,
@@ -170,6 +223,9 @@ def phase_controls(phase: str, pipeline: TableFixerPipeline) -> PipelineSnapshot
     if pending:
         st.subheader("Proposed decisions")
         show_decisions(pending)
+        if phase == "warnings":
+            st.subheader("Cell repairs: before and after")
+            show_cell_repairs(source, pending.proposed_snapshot, pending)
         st.subheader("Proposed result")
         show_tables(pending.proposed_snapshot)
         accept, reject = st.columns(2)
@@ -321,6 +377,14 @@ with tabs[4]:
 with tabs[5]:
     accepted = phase_controls("warnings", pipeline)
     if accepted:
+        source = st.session_state.phase_snapshots["columns"]
+        warning_decisions = [
+            decision for decision in accepted.decisions
+            if decision.phase == "warnings"
+        ]
+        accepted_run = PhaseRun("warnings", source.snapshot_id, accepted, warning_decisions, [])
+        st.subheader("Accepted cell repairs: before and after")
+        show_cell_repairs(source, accepted, accepted_run)
         st.subheader("Remaining warnings")
         st.dataframe(
             pd.DataFrame([issue.__dict__ for issue in accepted.active_warnings()]),

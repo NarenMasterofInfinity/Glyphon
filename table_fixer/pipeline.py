@@ -8,6 +8,7 @@ from uuid import uuid4
 from .context import (
     adjacent_table_pairs,
     allowed_header_continuations,
+    cell_warning_context,
     column_split_context,
     ensure_profiles,
     fit_context_budget,
@@ -15,9 +16,9 @@ from .context import (
     header_context,
     metadata_candidate_prefix,
     metadata_context,
+    row_repair_context,
     table_pair_evidence,
     table_reconciliation_context,
-    warning_context,
 )
 from .models import (
     CellState,
@@ -35,6 +36,7 @@ from .repairs import (
     apply_table_reconciliation,
     apply_warning_decisions,
     decision,
+    infer_whitespace_split,
     validate_split_regex,
     validate_warning_action,
 )
@@ -43,7 +45,7 @@ from .schemas import (
     HEADER_SCHEMA,
     METADATA_SCHEMA,
     TABLE_RECONCILIATION_SCHEMA,
-    WARNING_BATCH_SCHEMA,
+    ROW_REPAIR_SCHEMA,
 )
 
 
@@ -62,14 +64,17 @@ SYSTEM_PROMPTS = {
         "Predecessor tail rows are context only and may reveal a preceding header fragment. Return only schema JSON."
     ),
     "columns": (
-        "You decide whether a warned merged column should split. Use a Python full-match regex with 2-4 named "
-        "groups. New header words must come only from the existing merged header. Return only schema JSON."
+        "Work on the one supplied column only. Decide whether every sample contains the same multiple fields. "
+        "Repeated whitespace-separated parts with different stable formats are separate fields, even when the "
+        "current header combines their names. "
+        "If yes, return a Python full-match regex with 2-4 named groups and clear field headers. "
+        "If no, return no_split. Do not repeat the prompt. Return only schema JSON."
     ),
     "warnings": (
-        "For every supplied parser warning, make a binary decision: correction needed or no correction needed. "
-        "Never request manual review. If correction is needed, select exactly one executable allowed correction "
-        "action and provide its payload. Use the relevant logical headers and nearby cells. Return only schema JSON "
-        "and never propose row or column structural changes."
+        "Repair the one supplied row problem. Consider only the listed columns. Arrange available_parts under the "
+        "correct headers. Nearby examples are context only and must not appear in output unless already present in "
+        "available_parts. Return final_values mapping headers to final non-empty text. Use every available part "
+        "exactly once. Do not calculate, invent, or request manual review. Return only schema JSON."
     ),
     "regex_repair": (
         "Repair only the supplied Python regex so actual output exactly matches expected output. "
@@ -245,11 +250,10 @@ class TableFixerPipeline:
     ) -> list[dict[str, Any]]:
         contracts = {
             "none": {},
-            "move_cell": {"source_cell_id": "existing cell ID", "target_cell_id": "existing empty cell ID"},
-            "merge_adjacent_cells": {"source_cell_id": "existing cell ID", "target_cell_id": "adjacent cell ID"},
-            "split_cell_text": {
-                "source_cell_id": "existing cell ID",
-                "new_text": "corrected replacement text that differs from current text",
+            "redistribute_cell": {
+                "source_cell_id": "the supplied cell_id",
+                "issue_ids": "all supplied issue_ids for the cell",
+                "assignments": [{"target_cell_id": "supplied row destination", "text": "source text segment"}],
             },
         }
         batches: list[dict[str, Any]] = []
@@ -497,6 +501,8 @@ class TableFixerPipeline:
                 current.decisions.append(record)
                 current.issues[issue_id].status = "review"
                 continue
+            private_table_id = context.pop("_table_id")
+            private_column_id = context.pop("_column_id")
             response = self._call("columns", f"column:{issue_id}", context, COLUMN_SPLIT_SCHEMA)
             responses.append(response)
             parsed = response.parsed or {}
@@ -506,25 +512,25 @@ class TableFixerPipeline:
             compiled = None
             actual: dict[str, list[str]] = {}
             payload = {
-                "table_id": context["table_id"],
-                "column_id": context["column_id"],
+                "table_id": private_table_id,
+                "column_id": private_column_id,
                 "regex": parsed.get("regex", ""),
                 "new_headers": parsed.get("new_headers", []),
                 "expected": parsed.get("expected", {}),
             }
             if action == "no_split":
                 payload = {
-                    "table_id": context["table_id"],
-                    "column_id": context["column_id"],
+                    "table_id": private_table_id,
+                    "column_id": private_column_id,
                 }
             if action == "split":
-                table = current.tables[context["table_id"]]
+                table = current.tables[private_table_id]
                 values = [
                     cell.text for row_id in table.row_ids
-                    if (cell := current.cells.get(f"{row_id}::{context['column_id']}")) and cell.text.strip()
+                    if (cell := current.cells.get(f"{row_id}::{private_column_id}")) and cell.text.strip()
                 ]
                 compiled, validation_errors, actual = validate_split_regex(
-                    context["header"],
+                    context["current_header"],
                     payload["regex"],
                     payload["new_headers"],
                     values,
@@ -534,7 +540,8 @@ class TableFixerPipeline:
                 repair_count = 0
                 while errors and repair_count < 2:
                     repair_context = {
-                        "source_header": context["header"],
+                        "source_header": context["current_header"],
+                        "sample_values": values[:5],
                         "regex": payload["regex"],
                         "errors": errors,
                         "actual": actual,
@@ -553,12 +560,24 @@ class TableFixerPipeline:
                     payload["regex"] = repaired_parsed.get("regex", payload["regex"])
                     payload["new_headers"] = repaired_parsed.get("new_headers", payload["new_headers"])
                     compiled, errors, actual = validate_split_regex(
-                        context["header"],
+                        context["current_header"],
                         payload["regex"],
                         payload["new_headers"],
                         values,
                         payload["expected"],
                     )
+                if errors:
+                    inferred = infer_whitespace_split(context["current_header"], values)
+                    if inferred:
+                        payload["regex"], payload["new_headers"] = inferred
+                        payload["expected"] = {}
+                        compiled, errors, actual = validate_split_regex(
+                            context["current_header"],
+                            payload["regex"],
+                            payload["new_headers"],
+                            values,
+                            {},
+                        )
             valid = not errors and (not auto_apply or confidence >= self.structural_auto_apply_threshold)
             record = decision(
                 "columns",
@@ -585,86 +604,130 @@ class TableFixerPipeline:
     def run_warnings(self, snapshot: PipelineSnapshot, *, auto_apply: bool = False) -> PhaseRun:
         records: list[DecisionRecord] = []
         responses: list[StructuredResponse] = []
-        warnings = [
-            issue for issue in snapshot.active_warnings()
-            if issue.issue_type != "possible_merged_column"
-        ]
-        groups: dict[tuple[str | None, str], list[IssueState]] = {}
-        for issue in warnings:
-            groups.setdefault((issue.table_id, issue.issue_type), []).append(issue)
-        for (table_id, issue_type), grouped in groups.items():
-            contexts = [warning_context(snapshot, issue.issue_id) for issue in grouped]
-            for batch_index, batch in enumerate(self._warning_batches(table_id, issue_type, contexts), start=1):
-                response = self._call(
-                    "warnings",
-                    f"warnings:{table_id}:{issue_type}:{batch_index}",
-                    batch,
-                    WARNING_BATCH_SCHEMA,
-                )
-                responses.append(response)
-                valid_issue_ids = {
-                    warning["issue"]["issue_id"]
-                    for warning in batch["warnings"]
-                }
-                decided_issue_ids: set[str] = set()
-                for parsed in (response.parsed or {}).get("decisions", []):
-                    issue_id = parsed.get("issue_id", "")
-                    if issue_id in decided_issue_ids:
+        row_issues: dict[str, list[IssueState]] = {}
+        for issue in snapshot.issues.values():
+            if issue.status != "active" or issue.issue_type == "possible_merged_column":
+                continue
+            for cell_id in issue.affected_cell_ids:
+                if cell_id in snapshot.cells:
+                    row_id = snapshot.cells[cell_id].row_id
+                    if issue not in row_issues.setdefault(row_id, []):
+                        row_issues[row_id].append(issue)
+        for row_id, issues in row_issues.items():
+            context = row_repair_context(snapshot, row_id, issues)
+            issue_ids = context.pop("_issue_ids")
+            column_ids_by_header = context.pop("_column_ids_by_header")
+            context.pop("_row_id")
+            def build_record(response: StructuredResponse) -> DecisionRecord:
+                parsed = response.parsed or {}
+                if isinstance(parsed.get("decisions"), list) and parsed["decisions"]:
+                    legacy = parsed["decisions"][0]
+                    legacy_payload = legacy.get("payload", {})
+                    reverse_headers = {
+                        f"{row_id}::{column_id}": header
+                        for header, column_id in column_ids_by_header.items()
+                    }
+                    legacy_action = legacy.get("correction_action", legacy.get("action", "none"))
+                    legacy_assignments = []
+                    if legacy_action == "move_cell":
+                        source_id = legacy_payload.get("source_cell_id")
+                        target_id = legacy_payload.get("target_cell_id")
+                        if source_id in snapshot.cells and target_id in reverse_headers:
+                            legacy_assignments = [{
+                                "target_header": reverse_headers[target_id],
+                                "text": snapshot.cells[source_id].text,
+                            }]
+                    elif legacy_action == "redistribute_cell":
+                        legacy_assignments = [
+                            {
+                                "target_header": reverse_headers.get(assignment.get("target_cell_id"), ""),
+                                "text": assignment.get("text"),
+                            }
+                            for assignment in legacy_payload.get("assignments", [])
+                            if isinstance(assignment, dict)
+                        ]
+                    parsed = {
+                        "needs_correction": legacy.get("needs_correction", legacy_action != "none"),
+                        "confidence": legacy.get("confidence", 0),
+                        "reason": legacy.get("reason", ""),
+                        "assignments": legacy_assignments,
+                    }
+                errors = list(response.validation_errors)
+                needs_correction = parsed.get("needs_correction")
+                action = "redistribute_row" if needs_correction is True else "no_issue"
+                if needs_correction not in {True, False}:
+                    action = "invalid_warning_decision"
+                    errors.append("Row repair decision must provide a binary needs_correction value.")
+                raw_assignments = parsed.get("assignments", [])
+                if isinstance(parsed.get("final_values"), dict):
+                    raw_assignments = [
+                        {"target_header": header, "text": text}
+                        for header, text in parsed["final_values"].items()
+                    ]
+                assignments = []
+                for assignment in raw_assignments:
+                    header = assignment.get("target_header") if isinstance(assignment, dict) else None
+                    text = assignment.get("text") if isinstance(assignment, dict) else None
+                    column_id = column_ids_by_header.get(header)
+                    if not column_id:
+                        errors.append(f"Unknown or unavailable target header: {header}")
                         continue
-                    decided_issue_ids.add(issue_id)
-                    errors = list(response.validation_errors)
-                    if issue_id not in valid_issue_ids:
-                        errors.append("Decision references an issue outside the supplied warning batch.")
-                    confidence = float(parsed.get("confidence", 0))
-                    needs_correction = parsed.get("needs_correction")
-                    correction_action = parsed.get("correction_action", "none")
-                    if needs_correction is True:
-                        action = correction_action
-                        if action == "none":
-                            errors.append("A correction-needed decision must provide an executable correction action.")
-                    elif needs_correction is False:
-                        action = "no_issue"
-                        if correction_action != "none":
-                            errors.append("A no-correction decision must use correction_action 'none'.")
-                    else:
-                        action = "invalid_warning_decision"
-                        errors.append("Warning decision must provide a binary needs_correction value.")
-                    raw_payload = parsed.get("payload", {})
-                    payload = self._sanitize_warning_payload(action, raw_payload)
-                    record = decision(
-                        "warnings",
-                        issue_id,
-                        action,
-                        confidence,
-                        parsed.get("reason", ""),
-                        payload,
-                        True,
-                        errors,
-                        response.prompt_id,
-                    )
-                    errors.extend(validate_warning_action(snapshot, record))
-                    required_confidence = max(self.auto_apply_threshold, 0.90) if action == "no_issue" else self.auto_apply_threshold
-                    record.valid = not errors and (not auto_apply or confidence >= required_confidence)
-                    records.append(record)
-                for missing_issue_id in sorted(valid_issue_ids - decided_issue_ids):
-                    records.append(
-                        decision(
-                            "warnings",
-                            missing_issue_id,
-                            "invalid_warning_decision",
-                            0.0,
-                            "The LLM omitted this warning instead of making the required binary decision.",
-                            {},
-                            False,
-                            ["Every supplied warning requires a binary decision."],
-                            response.prompt_id,
-                        )
-                    )
+                    if not isinstance(text, str) or not text.strip():
+                        errors.append("Assignments must contain non-empty final text only.")
+                        continue
+                    assignments.append({
+                        "target_cell_id": f"{row_id}::{column_id}",
+                        "text": text,
+                    })
+                if needs_correction is False and assignments:
+                    errors.append("A no-correction decision must not include assignments.")
+                payload = {
+                    "source_cell_ids": [
+                        f"{row_id}::{column_id}"
+                        for column_id in column_ids_by_header.values()
+                    ],
+                    "assignments": assignments,
+                    "issue_ids": issue_ids,
+                }
+                confidence = float(parsed.get("confidence", 0))
+                record = decision(
+                    "warnings", issue_ids[0], action, confidence, parsed.get("reason", ""),
+                    payload, True, errors, response.prompt_id,
+                )
+                errors.extend(validate_warning_action(snapshot, record))
+                required_confidence = max(self.auto_apply_threshold, 0.90) if action == "no_issue" else self.auto_apply_threshold
+                record.valid = not errors and (not auto_apply or confidence >= required_confidence)
+                return record
+
+            response = self._call("warnings", f"row_repair:{row_id}", context, ROW_REPAIR_SCHEMA)
+            responses.append(response)
+            record = build_record(response)
+            if not record.valid and record.action == "redistribute_row":
+                retry_context = {
+                    **context,
+                    "retry_instruction": (
+                        "Return corrected final_values only. Include each listed header at most once and omit empty "
+                        "values. Split merged text instead of copying it unchanged. Never duplicate or invent text."
+                    ),
+                    "previous_final_values": (response.parsed or {}).get(
+                        "final_values",
+                        (response.parsed or {}).get("assignments", []),
+                    ),
+                    "validation_errors": record.validation_errors,
+                }
+                retry = self._call("warnings", f"row_repair_retry:{row_id}", retry_context, ROW_REPAIR_SCHEMA, response.prompt_id)
+                responses.append(retry)
+                record = build_record(retry)
+            records.append(record)
         touched: set[str] = set()
         for record in records:
             action_cells = {
                 value for key, value in record.payload.items()
                 if key.endswith("_cell_id") and isinstance(value, str)
+            } | {
+                assignment.get("target_cell_id")
+                for assignment in record.payload.get("assignments", [])
+                if isinstance(assignment, dict) and isinstance(assignment.get("target_cell_id"), str)
             }
             if action_cells & touched and record.action != "no_issue":
                 record.valid = False
@@ -688,5 +751,17 @@ class TableFixerPipeline:
             return {
                 "source_cell_id": payload.get("source_cell_id", payload.get("cell_id")),
                 "new_text": payload.get("new_text", payload.get("new_cell_text")),
+            }
+        if action == "redistribute_cell":
+            return {
+                "source_cell_id": payload.get("source_cell_id", payload.get("cell_id")),
+                "assignments": [
+                    {
+                        "target_cell_id": assignment.get("target_cell_id"),
+                        "text": assignment.get("text"),
+                    }
+                    for assignment in payload.get("assignments", [])
+                    if isinstance(assignment, dict)
+                ],
             }
         return {}
