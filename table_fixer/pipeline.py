@@ -54,44 +54,55 @@ from .schemas import (
 )
 
 
+STRUCTURED_RESPONSE_INSTRUCTION = (
+    "Respond with one JSON object containing your decision values and matching the supplied response format. "
+    "Do not reproduce, describe, or return the JSON Schema itself. Do not use Markdown or add text outside the "
+    "JSON object."
+)
+
+
 SYSTEM_PROMPTS = {
     "reconciliation": (
         "You decide whether two adjacent extracted table segments are one accidentally split table. "
-        "Use the compact structural evidence and boundary rows. Keep distinct titled tables separate. "
-        "Return only schema JSON."
+        "Use the compact structural evidence and boundary rows. Keep distinct titled tables separate."
     ),
     "metadata": (
-        "You classify top table rows. Return only schema JSON. Metadata must be a contiguous top prefix. "
+        "You classify top table rows. Metadata must be a contiguous top prefix. "
         "Do not classify header continuations as metadata."
     ),
     "headers": (
         "You decide whether a candidate row is a table header and identify contiguous header continuations. "
-        "Predecessor tail rows are context only and may reveal a preceding header fragment. Return only schema JSON."
+        "Predecessor tail rows are context only and may reveal a preceding header fragment."
     ),
     "columns": (
         "Work on the one supplied column only. Decide whether every sample contains the same multiple fields. "
         "Repeated whitespace-separated parts with different stable formats are separate fields, even when the "
         "current header combines their names. "
         "If yes, return a Python full-match regex with 2-4 named groups and clear field headers. "
-        "If no, return no_split. Do not repeat the prompt. Return only schema JSON."
+        "If no, choose no_split."
     ),
     "placeholder_column": (
         "Resolve one unnamed placeholder column using one lossless whole-column rule. A move is valid only when "
         "each complete value is one semantic field matching one empty named column. Never move a merged multi-field "
         "value wholly into one target merely because it is empty. Split when repeated values contain separate fields "
         "described by multiple empty named columns and every value follows the same pattern. Rename only when the "
-        "values form a genuine distinct field. Return unresolved when none is reliable. Return only schema JSON."
+        "values form a genuine distinct field. Choose unresolved when none is reliable."
     ),
     "warnings": (
         "Repair the one supplied row problem. Consider only the listed columns. Arrange available_parts under the "
         "correct headers. Nearby examples are context only and must not appear in output unless already present in "
         "available_parts. Return final_values mapping headers to final non-empty text. Use every available part "
-        "exactly once. Do not calculate, invent, or request manual review. Return only schema JSON."
+        "exactly once. Do not calculate, invent, or request manual review."
     ),
     "regex_repair": (
         "Repair only the supplied Python regex so actual output exactly matches expected output. "
-        "Keep 2-4 named groups and return the column split schema JSON."
+        "Keep 2-4 named groups. Preserve the other supplied decision values."
     ),
+}
+
+SYSTEM_PROMPTS = {
+    phase: f"{prompt} {STRUCTURED_RESPONSE_INSTRUCTION}"
+    for phase, prompt in SYSTEM_PROMPTS.items()
 }
 
 

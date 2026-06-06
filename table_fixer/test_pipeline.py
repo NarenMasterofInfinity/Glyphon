@@ -16,7 +16,7 @@ from table_fixer.models import (
     RowState,
 )
 from table_fixer.ollama_client import OllamaLLMClient, StructuredResponse
-from table_fixer.pipeline import TableFixerPipeline, normalize_header_groups
+from table_fixer.pipeline import SYSTEM_PROMPTS, TableFixerPipeline, normalize_header_groups
 from table_fixer.repairs import apply_headers, decision
 from table_fixer.token_counting import TokenCounter
 from table_fixer.workspace import persist_snapshot
@@ -157,6 +157,13 @@ def make_adjacent_tables(left_rows, right_rows, column_names=("col_1", "col_2"))
 
 
 class PipelineTests(unittest.TestCase):
+    def test_system_prompts_request_decision_values_not_schema_definition(self):
+        for phase, prompt in SYSTEM_PROMPTS.items():
+            with self.subTest(phase=phase):
+                self.assertNotIn("schema json", prompt.lower())
+                self.assertIn("containing your decision values", prompt)
+                self.assertIn("Do not reproduce, describe, or return the JSON Schema itself.", prompt)
+
     def test_structured_client_records_native_and_estimated_usage(self):
         client = OllamaLLMClient(model="mock")
         client._post = lambda path, payload: {
