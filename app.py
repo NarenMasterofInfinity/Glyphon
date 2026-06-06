@@ -32,15 +32,24 @@ from correction import (
     split_column_by_delimiter,
     split_row_by_delimiter,
 )
-from parser import CellExtraction, PageExtractionResult, build_table_records, parse_pdf_pages, render_page_image
+from parser import (
+    CellExtraction,
+    PageExtractionResult,
+    all_assignments,
+    all_issues,
+    build_table_records,
+    diagnostic_sidecar,
+    parse_pdf_pages,
+    render_page_image,
+)
 from scanned_parser import extract_table_scanned
 
 
 st.set_page_config(page_title="Glyphon Table Fixer", layout="wide")
 st.title("Glyphon Table Fixer")
 
-PARSER_CACHE_VERSION = "2026-06-02-correction-workspace-v1"
-SYSTEM_COLUMNS = ["page_number", "row_number"]
+PARSER_CACHE_VERSION = "2026-06-06-displacement-diagnostics-v1"
+SYSTEM_COLUMNS = ["page_number", "table_index", "row_number"]
 
 VISUAL_WORKSPACE_HTML = """
 <div id="glyphon-root" class="workspace">
@@ -200,6 +209,10 @@ VISUAL_WORKSPACE_CSS = """
 .bbox.cell-hit {
   border-color: rgba(0, 130, 75, 1);
   background: rgba(0, 184, 107, 0.26);
+}
+.bbox.uncertain {
+  border: 2px dashed rgba(213, 72, 33, 1);
+  background: rgba(255, 152, 0, 0.13);
 }
 .guide {
   position: absolute;
@@ -524,6 +537,7 @@ export default function(component) {
     const box = document.createElement("div");
     box.className = "bbox";
     box.dataset.index = String(item.index);
+    if ((item.issueIds || []).length) box.classList.add("uncertain");
     box.style.left = `${(item.x0 / data.pageWidth) * 100}%`;
     box.style.top = `${(item.y0 / data.pageHeight) * 100}%`;
     box.style.width = `${((item.x1 - item.x0) / data.pageWidth) * 100}%`;
@@ -1391,9 +1405,16 @@ def visual_workspace_payload(
             "col": cell.col_index,
             "text": cell.text,
             "source": cell.source_item_indexes,
+            "assignmentScore": cell.assignment_score,
+            "issueIds": cell.issue_ids,
+            "alternatives": cell.alternatives,
         }
         for cell in getattr(page_result, "cells", [])
     ]
+
+    item_issue_ids: dict[int, list[str]] = {}
+    for assignment in getattr(page_result, "assignments", []):
+        item_issue_ids[int(assignment["source_item_index"])] = assignment.get("issue_ids", [])
 
     items = [
         {
@@ -1403,6 +1424,7 @@ def visual_workspace_payload(
             "y0": item.y0,
             "x1": item.x1,
             "y1": item.y1,
+            "issueIds": item_issue_ids.get(index, []),
         }
         for index, item in enumerate(page_result.raw_items)
     ]
@@ -1482,6 +1504,11 @@ def build_selective_page_result(page_result, polygon: list[dict[str, float]]) ->
             CellExtraction(page_number=page_result.page_number, **cell)
             for cell in extracted["cells"]
         ],
+        row_table_indexes=extracted["row_table_indexes"],
+        row_layout_region_indexes=extracted["row_layout_region_indexes"],
+        boundary_metadata=extracted["boundary_metadata"],
+        assignments=extracted["assignments"],
+        issues=extracted["issues"],
     )
 
 
@@ -2082,7 +2109,7 @@ def main() -> None:
             page_editor_df,
             width="stretch",
             height=430,
-            disabled=["row_number"],
+            disabled=["table_index", "row_number"],
             num_rows="fixed",
             key=f"page_editor_{workspace_state_key}_{selected_page}",
         )
@@ -2253,12 +2280,31 @@ def main() -> None:
         except Exception as exc:
             st.error(str(exc))
 
-    tabs = st.tabs(["Corrected Table", "Selective Extraction", "Lineage", "Export"])
+    tabs = st.tabs(["Corrected Table", "Uncertainty Review", "Selective Extraction", "Lineage", "Export"])
 
     with tabs[0]:
         st.dataframe(st.session_state.corrected_df, use_container_width=True, height=420)
 
     with tabs[1]:
+        page_issues = [
+            issue
+            for issue in getattr(page_result, "issues", [])
+            if issue.get("page_number") == selected_page
+        ]
+        if page_issues:
+            severity_counts = {}
+            for issue in page_issues:
+                severity = issue.get("severity", "unknown")
+                severity_counts[severity] = severity_counts.get(severity, 0) + 1
+            st.caption(
+                f"{len(page_issues)} parser diagnostics on page {selected_page}: "
+                + ", ".join(f"{key}={value}" for key, value in sorted(severity_counts.items()))
+            )
+            st.dataframe(pd.DataFrame(page_issues), use_container_width=True, height=420)
+        else:
+            st.info("No parser uncertainty was reported for this page.")
+
+    with tabs[2]:
         if selective_override and selective_override.get("file_key") == file_key:
             st.caption("Selective extraction is active for this upload.")
             if st.button("Return to full-page extraction", use_container_width=True):
@@ -2294,7 +2340,7 @@ def main() -> None:
                     load_selective_extraction(file_key, selective_result)
                     st.rerun()
 
-    with tabs[2]:
+    with tabs[3]:
         metadata = {
             "original_columns": st.session_state.original_df.columns.tolist(),
             "corrected_columns": st.session_state.corrected_df.columns.tolist(),
@@ -2305,10 +2351,12 @@ def main() -> None:
         }
         st.json(metadata)
 
-    with tabs[3]:
+    with tabs[4]:
+        parser_issues = all_issues(page_results)
+        parser_assignments = all_assignments(page_results)
         st.download_button(
             "Download corrected Excel",
-            data=dataframe_to_excel(st.session_state.corrected_df),
+            data=dataframe_to_excel(st.session_state.corrected_df, parser_issues, parser_assignments),
             file_name="glyphon_corrected_table.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True,
@@ -2323,12 +2371,23 @@ def main() -> None:
         export_metadata = {
             "original_extraction": st.session_state.original_df.to_dict(orient="records"),
             "corrected_table": st.session_state.corrected_df.to_dict(orient="records"),
+            "parser_diagnostics": diagnostic_sidecar(page_results),
             "operation_history": st.session_state.operation_history,
         }
         st.download_button(
             "Download correction metadata",
             data=json.dumps(export_metadata, indent=2).encode("utf-8"),
             file_name="glyphon_correction_metadata.json",
+            mime="application/json",
+            use_container_width=True,
+        )
+        st.download_button(
+            "Download parser diagnostic sidecar",
+            data=json.dumps(
+                diagnostic_sidecar(page_results, st.session_state.operation_history),
+                indent=2,
+            ).encode("utf-8"),
+            file_name="glyphon_extraction_diagnostics.json",
             mime="application/json",
             use_container_width=True,
         )

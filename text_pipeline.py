@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from math import cos, radians, sin
 from statistics import median
+from typing import Any
 
 
 @dataclass
@@ -137,6 +138,91 @@ def detect_column_boundaries(
             clusters.append([separator])
 
     return [sum(cluster) / len(cluster) for cluster in clusters]
+
+
+def detect_column_boundary_candidates(rows: list[list[BBoxItem]]) -> list[dict[str, Any]]:
+    """Return accepted and rejected boundary candidates with supporting evidence."""
+    if not rows:
+        return []
+
+    widths = [item.width for row in rows for item in row if item.width > 0]
+    heights = [item.height for row in rows for item in row if item.height > 0]
+    median_width = median(widths) if widths else 24.0
+    median_height = median(heights) if heights else 10.0
+    min_gap = max(10.0, median_width * 0.22)
+    merge_tolerance = max(12.0, median_width * 0.35)
+
+    separators: list[tuple[float, int, float]] = []
+    for row_index, row in enumerate(rows, start=1):
+        ordered = sorted(row, key=lambda item: item.x0)
+        for left_item, right_item in zip(ordered, ordered[1:]):
+            gap = right_item.x0 - left_item.x1
+            if gap >= min_gap:
+                separators.append(((left_item.x1 + right_item.x0) / 2, row_index, gap))
+
+    separators.sort(key=lambda entry: entry[0])
+    clusters: list[list[tuple[float, int, float]]] = []
+    for separator in separators:
+        if not clusters or separator[0] - clusters[-1][-1][0] > merge_tolerance:
+            clusters.append([separator])
+        else:
+            clusters[-1].append(separator)
+
+    candidates: list[dict[str, Any]] = []
+    row_count = max(1, len(rows))
+    for cluster in clusters:
+        supporting_rows = sorted({entry[1] for entry in cluster})
+        average_gap = sum(entry[2] for entry in cluster) / len(cluster)
+        support_score = len(supporting_rows) / row_count
+        strong_gap = average_gap >= max(median_height * 2.5, median_width * 0.8, 24.0)
+        accepted = len(supporting_rows) >= 2 or strong_gap
+        candidates.append(
+            {
+                "position": sum(entry[0] for entry in cluster) / len(cluster),
+                "supporting_rows": supporting_rows,
+                "support_count": len(supporting_rows),
+                "support_score": support_score,
+                "average_gap": average_gap,
+                "accepted": accepted,
+                "reason": "repeated_row_support" if len(supporting_rows) >= 2 else (
+                    "strong_gap" if strong_gap else "weak_single_row_gap"
+                ),
+            }
+        )
+    return candidates
+
+
+def column_intervals(boundaries: list[float], left_edge: float, right_edge: float) -> list[tuple[float, float]]:
+    edges = [left_edge] + sorted(boundaries) + [right_edge]
+    return list(zip(edges, edges[1:]))
+
+
+def score_item_for_columns(
+    item: BBoxItem,
+    boundaries: list[float],
+    left_edge: float,
+    right_edge: float,
+) -> list[dict[str, float | int]]:
+    """Score every candidate column using horizontal bbox overlap and center distance."""
+    intervals = column_intervals(boundaries, left_edge, right_edge)
+    item_width = max(item.width, 1e-6)
+    scored: list[dict[str, float | int]] = []
+    for index, (start, end) in enumerate(intervals, start=1):
+        overlap = max(0.0, min(item.x1, end) - max(item.x0, start))
+        overlap_ratio = overlap / item_width
+        interval_width = max(end - start, 1e-6)
+        center = (start + end) / 2
+        distance_score = max(0.0, 1.0 - abs(item.cx - center) / interval_width)
+        score = (overlap_ratio * 0.8) + (distance_score * 0.2)
+        scored.append(
+            {
+                "col_index": index,
+                "score": round(score, 6),
+                "overlap_ratio": round(overlap_ratio, 6),
+                "center_distance": round(abs(item.cx - center), 6),
+            }
+        )
+    return sorted(scored, key=lambda candidate: (-float(candidate["score"]), int(candidate["col_index"])))
 
 
 def assign_row_to_boundaries(row: list[BBoxItem], boundaries: list[float]) -> list[str]:

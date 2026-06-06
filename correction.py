@@ -3,12 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from io import BytesIO
+import json
 from typing import Any
 
 import pandas as pd
 
 
-SYSTEM_COLUMNS = ["page_number", "row_number"]
+SYSTEM_COLUMNS = ["page_number", "table_index", "row_number"]
 
 
 @dataclass
@@ -196,6 +197,9 @@ def insert_row(df: pd.DataFrame, after_index: int | None, page_number: int) -> p
     inserted = df.copy()
     row = {column: "" for column in inserted.columns}
     row["page_number"] = page_number
+    if "table_index" in row:
+        nearby_index = after_index if after_index is not None and after_index in inserted.index else None
+        row["table_index"] = int(inserted.at[nearby_index, "table_index"]) if nearby_index is not None else 1
     row["row_number"] = 0
     position = len(inserted) if after_index is None else after_index + 1
     inserted = pd.concat(
@@ -212,10 +216,26 @@ def delete_rows(df: pd.DataFrame, indexes: list[int]) -> pd.DataFrame:
     return normalize_row_numbers(deleted)
 
 
-def dataframe_to_excel(df: pd.DataFrame) -> bytes:
+def _excel_safe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        {
+            key: json.dumps(value, ensure_ascii=True) if isinstance(value, (dict, list, tuple)) else value
+            for key, value in record.items()
+        }
+        for record in records
+    ]
+
+
+def dataframe_to_excel(
+    df: pd.DataFrame,
+    issues: list[dict[str, Any]] | None = None,
+    assignments: list[dict[str, Any]] | None = None,
+) -> bytes:
     buffer = BytesIO()
     with pd.ExcelWriter(buffer) as writer:
         df.to_excel(writer, sheet_name="corrected_table", index=False)
+        pd.DataFrame(_excel_safe_records(issues or [])).to_excel(writer, sheet_name="extraction_issues", index=False)
+        pd.DataFrame(_excel_safe_records(assignments or [])).to_excel(writer, sheet_name="assignment_candidates", index=False)
     return buffer.getvalue()
 
 

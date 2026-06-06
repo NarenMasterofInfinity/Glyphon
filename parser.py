@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from io import BytesIO
+import json
 
 import fitz
 import numpy as np
@@ -23,6 +24,11 @@ class CellExtraction:
     x1: float | None
     y1: float | None
     source_item_indexes: list[int]
+    table_index: int
+    layout_region_index: int
+    assignment_score: float
+    alternatives: list[dict]
+    issue_ids: list[str]
 
 
 @dataclass
@@ -37,6 +43,11 @@ class PageExtractionResult:
     column_centers: list[list[float]]
     table_band: tuple[int, int]
     cells: list[CellExtraction]
+    row_table_indexes: list[int]
+    row_layout_region_indexes: list[int]
+    boundary_metadata: list[dict]
+    assignments: list[dict]
+    issues: list[dict]
 
 
 def _ocr_page(page: fitz.Page, page_number: int, ocr: RapidOCR, dpi: int) -> list[BBoxItem]:
@@ -106,6 +117,11 @@ def parse_pdf_pages(
                     CellExtraction(page_number=page_index + 1, **cell)
                     for cell in extracted["cells"]
                 ],
+                row_table_indexes=extracted["row_table_indexes"],
+                row_layout_region_indexes=extracted["row_layout_region_indexes"],
+                boundary_metadata=extracted["boundary_metadata"],
+                assignments=extracted["assignments"],
+                issues=extracted["issues"],
             )
         )
 
@@ -137,14 +153,19 @@ def _get_column_names(page: PageExtractionResult) -> list[str]:
 
 def build_table_records(pages: list[PageExtractionResult]) -> tuple[list[str], list[dict]]:
     max_cols = max((len(_get_column_names(page)) for page in pages), default=0)
-    headers = ["page_number", "row_number"] + [f"col_{index}" for index in range(1, max_cols + 1)]
+    headers = ["page_number", "table_index", "row_number"] + [f"col_{index}" for index in range(1, max_cols + 1)]
     records: list[dict] = []
 
     for page in pages:
         for row_index, row in enumerate(page.rows, start=1):
-            record = {"page_number": page.page_number, "row_number": row_index}
+            table_indexes = getattr(page, "row_table_indexes", [])
+            record = {
+                "page_number": page.page_number,
+                "table_index": table_indexes[row_index - 1] if row_index <= len(table_indexes) else 1,
+                "row_number": row_index,
+            }
             for col_index in range(max_cols):
-                header = headers[col_index + 2]
+                header = headers[col_index + 3]
                 record[header] = row[col_index] if col_index < len(row) else ""
             records.append(record)
 
@@ -159,4 +180,47 @@ def export_combined_table(pages: list[PageExtractionResult]) -> bytes:
     df = pd.DataFrame(records, columns=headers)
     with pd.ExcelWriter(buffer) as writer:
         df.to_excel(writer, sheet_name="tables", index=False)
+        pd.DataFrame(_excel_safe_records(all_issues(pages))).to_excel(writer, sheet_name="extraction_issues", index=False)
+        pd.DataFrame(_excel_safe_records(all_assignments(pages))).to_excel(writer, sheet_name="assignment_candidates", index=False)
     return buffer.getvalue()
+
+
+def all_issues(pages: list[PageExtractionResult]) -> list[dict]:
+    return [issue for page in pages for issue in getattr(page, "issues", [])]
+
+
+def all_assignments(pages: list[PageExtractionResult]) -> list[dict]:
+    return [assignment for page in pages for assignment in getattr(page, "assignments", [])]
+
+
+def _excel_safe_records(records: list[dict]) -> list[dict]:
+    return [
+        {
+            key: json.dumps(value, ensure_ascii=True) if isinstance(value, (dict, list, tuple)) else value
+            for key, value in record.items()
+        }
+        for record in records
+    ]
+
+
+def diagnostic_sidecar(pages: list[PageExtractionResult], operation_history: list[dict] | None = None) -> dict:
+    return {
+        "schema_version": "glyphon-extraction-diagnostics-v1",
+        "pages": [
+            {
+                "page_number": page.page_number,
+                "page_width": page.page_width,
+                "page_height": page.page_height,
+                "slant_angle": page.slant_angle,
+                "table_band": page.table_band,
+                "column_centers": page.column_centers,
+                "boundaries": getattr(page, "boundary_metadata", []),
+                "cells": [asdict(cell) for cell in getattr(page, "cells", [])],
+                "assignments": getattr(page, "assignments", []),
+                "issues": getattr(page, "issues", []),
+                "source_items": [asdict(item) for item in page.raw_items],
+            }
+            for page in pages
+        ],
+        "operation_history": operation_history or [],
+    }
