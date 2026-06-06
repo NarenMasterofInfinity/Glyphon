@@ -57,21 +57,28 @@ WARNING_BATCH_SCHEMA = {
                 "type": "object",
                 "properties": {
                     "issue_id": {"type": "string"},
-                    "action": {
+                    "needs_correction": {"type": "boolean"},
+                    "correction_action": {
                         "type": "string",
                         "enum": [
-                            "no_issue",
+                            "none",
                             "move_cell",
                             "merge_adjacent_cells",
                             "split_cell_text",
-                            "mark_for_review",
                         ],
                     },
                     "confidence": CONFIDENCE,
                     "reason": {"type": "string"},
                     "payload": {"type": "object"},
                 },
-                "required": ["issue_id", "action", "confidence", "reason", "payload"],
+                "required": [
+                    "issue_id",
+                    "needs_correction",
+                    "correction_action",
+                    "confidence",
+                    "reason",
+                    "payload",
+                ],
             },
         }
     },

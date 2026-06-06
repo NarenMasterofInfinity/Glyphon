@@ -66,8 +66,10 @@ SYSTEM_PROMPTS = {
         "groups. New header words must come only from the existing merged header. Return only schema JSON."
     ),
     "warnings": (
-        "You classify parser warnings and select only an allowed conservative repair action. "
-        "Return only schema JSON and never propose row or column structural changes."
+        "For every supplied parser warning, make a binary decision: correction needed or no correction needed. "
+        "Never request manual review. If correction is needed, select exactly one executable allowed correction "
+        "action and provide its payload. Use the relevant logical headers and nearby cells. Return only schema JSON "
+        "and never propose row or column structural changes."
     ),
     "regex_repair": (
         "Repair only the supplied Python regex so actual output exactly matches expected output. "
@@ -241,22 +243,42 @@ class TableFixerPipeline:
         issue_type: str,
         contexts: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
+        contracts = {
+            "none": {},
+            "move_cell": {"source_cell_id": "existing cell ID", "target_cell_id": "existing empty cell ID"},
+            "merge_adjacent_cells": {"source_cell_id": "existing cell ID", "target_cell_id": "adjacent cell ID"},
+            "split_cell_text": {
+                "source_cell_id": "existing cell ID",
+                "new_text": "corrected replacement text that differs from current text",
+            },
+        }
         batches: list[dict[str, Any]] = []
         current: list[dict[str, Any]] = []
         for context in contexts:
             candidate = {
                 "table_id": table_id,
                 "issue_type": issue_type,
+                "correction_payload_contracts": contracts,
                 "warnings": current + [context],
             }
             token_count = self.client.token_counter.count(json.dumps(candidate, separators=(",", ":")))
             if current and token_count > self.context_token_budget:
-                batches.append({"table_id": table_id, "issue_type": issue_type, "warnings": current})
+                batches.append({
+                    "table_id": table_id,
+                    "issue_type": issue_type,
+                    "correction_payload_contracts": contracts,
+                    "warnings": current,
+                })
                 current = [context]
             else:
                 current.append(context)
         if current:
-            batches.append({"table_id": table_id, "issue_type": issue_type, "warnings": current})
+            batches.append({
+                "table_id": table_id,
+                "issue_type": issue_type,
+                "correction_payload_contracts": contracts,
+                "warnings": current,
+            })
         return batches
 
     @staticmethod
@@ -594,7 +616,19 @@ class TableFixerPipeline:
                     if issue_id not in valid_issue_ids:
                         errors.append("Decision references an issue outside the supplied warning batch.")
                     confidence = float(parsed.get("confidence", 0))
-                    action = parsed.get("action", "mark_for_review")
+                    needs_correction = parsed.get("needs_correction")
+                    correction_action = parsed.get("correction_action", "none")
+                    if needs_correction is True:
+                        action = correction_action
+                        if action == "none":
+                            errors.append("A correction-needed decision must provide an executable correction action.")
+                    elif needs_correction is False:
+                        action = "no_issue"
+                        if correction_action != "none":
+                            errors.append("A no-correction decision must use correction_action 'none'.")
+                    else:
+                        action = "invalid_warning_decision"
+                        errors.append("Warning decision must provide a binary needs_correction value.")
                     raw_payload = parsed.get("payload", {})
                     payload = self._sanitize_warning_payload(action, raw_payload)
                     record = decision(
@@ -609,8 +643,6 @@ class TableFixerPipeline:
                         response.prompt_id,
                     )
                     errors.extend(validate_warning_action(snapshot, record))
-                    if auto_apply and action not in {"no_issue", "mark_for_review"}:
-                        errors.append("Mutating cell repairs require explicit preview approval.")
                     required_confidence = max(self.auto_apply_threshold, 0.90) if action == "no_issue" else self.auto_apply_threshold
                     record.valid = not errors and (not auto_apply or confidence >= required_confidence)
                     records.append(record)
@@ -619,12 +651,12 @@ class TableFixerPipeline:
                         decision(
                             "warnings",
                             missing_issue_id,
-                            "mark_for_review",
+                            "invalid_warning_decision",
                             0.0,
-                            "The LLM omitted this warning from its batch response.",
+                            "The LLM omitted this warning instead of making the required binary decision.",
                             {},
-                            True,
-                            [],
+                            False,
+                            ["Every supplied warning requires a binary decision."],
                             response.prompt_id,
                         )
                     )
@@ -634,9 +666,8 @@ class TableFixerPipeline:
                 value for key, value in record.payload.items()
                 if key.endswith("_cell_id") and isinstance(value, str)
             }
-            if action_cells & touched and record.action not in {"no_issue", "mark_for_review"}:
+            if action_cells & touched and record.action != "no_issue":
                 record.valid = False
-                record.action = "mark_for_review"
                 record.validation_errors.append("Conflicting action affects a cell already changed in this batch.")
             if record.valid:
                 touched.update(action_cells)
@@ -646,18 +677,16 @@ class TableFixerPipeline:
 
     @staticmethod
     def _sanitize_warning_payload(action: str, payload: dict[str, Any]) -> dict[str, Any]:
-        if action in {"no_issue", "mark_for_review"}:
+        if action in {"no_issue", "invalid_warning_decision"}:
             return {}
         if action in {"move_cell", "merge_adjacent_cells"}:
             return {
-                key: payload[key]
-                for key in ("source_cell_id", "target_cell_id")
-                if isinstance(payload.get(key), str)
+                "source_cell_id": payload.get("source_cell_id", payload.get("cell_id")),
+                "target_cell_id": payload.get("target_cell_id"),
             }
         if action == "split_cell_text":
             return {
-                key: payload[key]
-                for key in ("source_cell_id", "new_text")
-                if isinstance(payload.get(key), str)
+                "source_cell_id": payload.get("source_cell_id", payload.get("cell_id")),
+                "new_text": payload.get("new_text", payload.get("new_cell_text")),
             }
         return {}

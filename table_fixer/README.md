@@ -20,5 +20,5 @@ It contains raw parser diagnostics and CSVs, normalized source data, phase previ
 snapshots, LLM responses, decisions, token usage, preserved metadata/headers, and final table CSVs.
 
 Structural auto-apply defaults to a conservative `0.95` confidence threshold. Cell moves and other
-mutating warning repairs always require preview approval, occupied-target moves are rejected, and
-invalid metadata/header decisions cannot consume or partially mutate a table.
+warning repairs are applied only after binary LLM decisions pass deterministic validation; occupied-target
+moves are rejected, and invalid metadata/header decisions cannot consume or partially mutate a table.

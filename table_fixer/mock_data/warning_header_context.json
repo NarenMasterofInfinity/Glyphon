@@ -1,0 +1,49 @@
+{
+  "columns": [
+    "Employee Name",
+    "Age",
+    "Department"
+  ],
+  "rows": [
+    [
+      "Alice",
+      "Engineering",
+      ""
+    ],
+    [
+      "Bob",
+      "42",
+      "Sales"
+    ]
+  ],
+  "warnings": [
+    {
+      "issue_id": "misplaced_department",
+      "issue_type": "ambiguous_column_assignment",
+      "row": 1,
+      "column": 2,
+      "expected_header": "Department",
+      "expected_action": "move_cell"
+    },
+    {
+      "issue_id": "correct_age",
+      "issue_type": "ambiguous_column_assignment",
+      "row": 2,
+      "column": 2,
+      "expected_header": "Age",
+      "expected_action": "no_issue"
+    }
+  ],
+  "expected_rows": [
+    [
+      "Alice",
+      "",
+      "Engineering"
+    ],
+    [
+      "Bob",
+      "42",
+      "Sales"
+    ]
+  ]
+}

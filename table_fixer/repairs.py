@@ -444,8 +444,10 @@ def validate_warning_action(snapshot: PipelineSnapshot, record: DecisionRecord) 
     errors: list[str] = []
     action = record.action
     payload = record.payload
-    if action in {"no_issue", "mark_for_review"}:
+    if action == "no_issue":
         return errors
+    if action not in {"move_cell", "merge_adjacent_cells", "split_cell_text"}:
+        return ["Correction decision does not contain an allowed executable action."]
     source_id = payload.get("source_cell_id")
     target_id = payload.get("target_cell_id")
     if source_id not in snapshot.cells:
@@ -472,8 +474,12 @@ def validate_warning_action(snapshot: PipelineSnapshot, record: DecisionRecord) 
             col_distance = abs(table.column_ids.index(source.column_id) - table.column_ids.index(target.column_id))
             if row_distance + col_distance != 1:
                 errors.append("Cells to merge must be adjacent.")
-    if action == "split_cell_text" and not isinstance(payload.get("new_text"), str):
-        errors.append("split_cell_text requires a replacement new_text and cannot create columns.")
+    if action == "split_cell_text":
+        new_text = payload.get("new_text")
+        if not isinstance(new_text, str):
+            errors.append("split_cell_text requires a replacement new_text and cannot create columns.")
+        elif new_text == snapshot.cells[source_id].text:
+            errors.append("split_cell_text replacement must differ from the current cell text.")
     return errors
 
 
@@ -486,8 +492,6 @@ def apply_warning_decisions(snapshot: PipelineSnapshot, records: list[DecisionRe
             continue
         if record.action == "no_issue":
             issue.status = "dismissed"
-        elif record.action == "mark_for_review":
-            issue.status = "review"
         elif record.action == "move_cell":
             source = result.cells[record.payload["source_cell_id"]]
             target = result.cells[record.payload["target_cell_id"]]

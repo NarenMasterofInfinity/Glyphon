@@ -412,8 +412,35 @@ def warning_context(snapshot: PipelineSnapshot, issue_id: str) -> dict[str, Any]
                     cell_id = f"{table.row_ids[ri]}::{table.column_ids[ci]}"
                     if cell_id in snapshot.cells:
                         nearby_ids.add(cell_id)
+    relevant_column_ids = []
+    if table:
+        target_column_ids = {
+            cell.column_id for cell in target_cells if cell.column_id in table.column_ids
+        }
+        for column_id in table.column_ids:
+            if any(
+                abs(table.column_ids.index(column_id) - table.column_ids.index(target_column_id)) <= 1
+                for target_column_id in target_column_ids
+            ):
+                relevant_column_ids.append(column_id)
     return {
         "issue": issue.__dict__,
+        "relevant_headers": (
+            [
+                {
+                    "column_id": column_id,
+                    "name": table.column_names.get(column_id, column_id),
+                    "header_values": [
+                        snapshot.cells[cell_id].text
+                        for row_id in table.header_row_ids
+                        if (cell_id := f"{row_id}::{column_id}") in snapshot.cells
+                        and snapshot.cells[cell_id].text.strip()
+                    ],
+                }
+                for column_id in relevant_column_ids
+            ]
+            if table else []
+        ),
         "cells": [
             {
                 "cell_id": cell.cell_id,

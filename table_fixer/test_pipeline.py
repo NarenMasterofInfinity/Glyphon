@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -45,6 +46,50 @@ class MockClient:
             duration_ms=1.0,
         )
         return StructuredResponse(prompt_id, parsed, "{}", [], usage)
+
+
+class HeaderAwareMockClient(MockClient):
+    """Makes binary warning decisions using only the warning prompt context."""
+
+    def __init__(self):
+        super().__init__([])
+
+    def structured(self, **kwargs):
+        decisions = []
+        for warning in kwargs["context"]["warnings"]:
+            issue = warning["issue"]
+            source_id = issue["affected_cell_ids"][0]
+            source_column_id = source_id.split("::", 1)[1]
+            headers = {
+                header["column_id"]: header["name"]
+                for header in warning["relevant_headers"]
+            }
+            expected_header = issue["evidence"]["expected_header"]
+            target_column_id = next(
+                (column_id for column_id, name in headers.items() if name == expected_header),
+                None,
+            )
+            if headers.get(source_column_id) == expected_header:
+                decisions.append({
+                    "issue_id": issue["issue_id"],
+                    "needs_correction": False,
+                    "correction_action": "none",
+                    "confidence": 0.99,
+                    "reason": f"Value is already under {expected_header}.",
+                    "payload": {},
+                })
+                continue
+            target_id = f"{source_id.split('::', 1)[0]}::{target_column_id}"
+            decisions.append({
+                "issue_id": issue["issue_id"],
+                "needs_correction": True,
+                "correction_action": "move_cell",
+                "confidence": 0.99,
+                "reason": f"Value belongs under {expected_header}.",
+                "payload": {"source_cell_id": source_id, "target_cell_id": target_id},
+            })
+        self.responses.append({"decisions": decisions})
+        return super().structured(**kwargs)
 
 
 def make_snapshot(row_values, column_names=("col_1", "col_2"), issues=None):
@@ -383,7 +428,8 @@ class PipelineTests(unittest.TestCase):
         client = MockClient([{
             "decisions": [{
                 "issue_id": "warn",
-                "action": "no_issue",
+                "needs_correction": False,
+                "correction_action": "none",
                 "confidence": 0.9,
                 "reason": "placement is coherent",
                 "payload": {},
@@ -396,7 +442,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.proposed_snapshot.issues["warn"].status, "dismissed")
         self.assertEqual(result.proposed_snapshot.issues["info"].status, "active")
 
-    def test_phase_four_auto_apply_never_mutates_cells(self):
+    def test_warning_correction_rejects_invalid_occupied_target_move(self):
         snapshot = make_snapshot([["Bob", "20"]])
         source_cell = "p1_t1_r1::p1_t1_c1"
         target_cell = "p1_t1_r1::p1_t1_c2"
@@ -407,7 +453,8 @@ class PipelineTests(unittest.TestCase):
         client = MockClient([{
             "decisions": [{
                 "issue_id": "warn",
-                "action": "move_cell",
+                "needs_correction": True,
+                "correction_action": "move_cell",
                 "confidence": 1.0,
                 "reason": "move",
                 "payload": {"source_cell_id": source_cell, "target_cell_id": target_cell},
@@ -424,6 +471,140 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.proposed_snapshot.cells[source_cell].text, "Bob")
         self.assertEqual(result.proposed_snapshot.cells[target_cell].text, "20")
         self.assertEqual(result.proposed_snapshot.issues["warn"].status, "active")
+
+    def test_warning_context_includes_relevant_logical_headers(self):
+        snapshot = make_snapshot([["Bob", "20"]], column_names=("Name", "Age"))
+        warning_cell = "p1_t1_r1::p1_t1_c1"
+        snapshot.issues["warn"] = IssueState(
+            "warn", "warn", "ambiguous_column_assignment", "warning", "p1_t1",
+            [warning_cell], "active", "warning", "review",
+        )
+        client = MockClient([{
+            "decisions": [{
+                "issue_id": "warn",
+                "needs_correction": False,
+                "correction_action": "none",
+                "confidence": 0.95,
+                "reason": "Name is correctly under Name",
+                "payload": {},
+            }]
+        }])
+
+        TableFixerPipeline(client).run_warnings(snapshot)
+
+        relevant = client.calls[0]["context"]["warnings"][0]["relevant_headers"]
+        self.assertEqual([header["name"] for header in relevant], ["Name", "Age"])
+        self.assertEqual(
+            client.calls[0]["context"]["correction_payload_contracts"]["move_cell"],
+            {"source_cell_id": "existing cell ID", "target_cell_id": "existing empty cell ID"},
+        )
+
+    def test_warning_binary_correction_applies_valid_code_action(self):
+        snapshot = make_snapshot([["Bob", ""]])
+        source_cell = "p1_t1_r1::p1_t1_c1"
+        target_cell = "p1_t1_r1::p1_t1_c2"
+        snapshot.issues["warn"] = IssueState(
+            "warn", "warn", "ambiguous_column_assignment", "warning", "p1_t1",
+            [source_cell], "active", "warning", "review",
+        )
+        client = MockClient([{
+            "decisions": [{
+                "issue_id": "warn",
+                "needs_correction": True,
+                "correction_action": "move_cell",
+                "confidence": 0.99,
+                "reason": "value belongs under Age",
+                "payload": {"source_cell_id": source_cell, "target_cell_id": target_cell},
+            }]
+        }])
+
+        result = TableFixerPipeline(client).run_warnings(snapshot, auto_apply=True)
+
+        self.assertEqual(result.proposed_snapshot.cells[source_cell].text, "")
+        self.assertEqual(result.proposed_snapshot.cells[target_cell].text, "Bob")
+        self.assertEqual(result.proposed_snapshot.issues["warn"].status, "resolved")
+
+    def test_mock_warning_data_uses_headers_for_binary_decisions_and_code_repairs(self):
+        fixture_path = Path(__file__).parent / "mock_data" / "warning_header_context.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        snapshot = make_snapshot(fixture["rows"], tuple(fixture["columns"]))
+        for warning in fixture["warnings"]:
+            cell_id = (
+                f"p1_t1_r{warning['row']}::"
+                f"p1_t1_c{warning['column']}"
+            )
+            snapshot.issues[warning["issue_id"]] = IssueState(
+                warning["issue_id"],
+                warning["issue_id"],
+                warning["issue_type"],
+                "warning",
+                "p1_t1",
+                [cell_id],
+                "active",
+                "Mock parser warning",
+                "repair",
+                evidence={"expected_header": warning["expected_header"]},
+            )
+
+        result = TableFixerPipeline(HeaderAwareMockClient()).run_warnings(
+            snapshot,
+            auto_apply=True,
+        )
+
+        actions = {record.target_id: record.action for record in result.decisions}
+        expected_actions = {
+            warning["issue_id"]: warning["expected_action"]
+            for warning in fixture["warnings"]
+        }
+        self.assertEqual(actions, expected_actions)
+        self.assertNotIn("mark_for_review", actions.values())
+        actual_rows = [
+            [
+                result.proposed_snapshot.cells[f"p1_t1_r{row}::p1_t1_c{column}"].text
+                for column in range(1, len(fixture["columns"]) + 1)
+            ]
+            for row in range(1, len(fixture["rows"]) + 1)
+        ]
+        self.assertEqual(actual_rows, fixture["expected_rows"])
+        self.assertEqual(result.proposed_snapshot.issues["misplaced_department"].status, "resolved")
+        self.assertEqual(result.proposed_snapshot.issues["correct_age"].status, "dismissed")
+
+    def test_warning_correction_normalizes_supported_payload_aliases(self):
+        snapshot = make_snapshot([["Bad text", ""]])
+        source_cell = "p1_t1_r1::p1_t1_c1"
+        snapshot.issues["warn"] = IssueState(
+            "warn", "warn", "item_crosses_boundary", "warning", "p1_t1",
+            [source_cell], "active", "warning", "repair",
+        )
+        client = MockClient([{
+            "decisions": [{
+                "issue_id": "warn",
+                "needs_correction": True,
+                "correction_action": "split_cell_text",
+                "confidence": 0.99,
+                "reason": "replace text",
+                "payload": {"cell_id": source_cell, "new_cell_text": "Correct text"},
+            }]
+        }])
+
+        result = TableFixerPipeline(client).run_warnings(snapshot)
+
+        self.assertEqual(result.proposed_snapshot.cells[source_cell].text, "Correct text")
+        self.assertEqual(result.proposed_snapshot.issues["warn"].status, "resolved")
+
+    def test_omitted_warning_stays_active_without_manual_review(self):
+        snapshot = make_snapshot([["Bob", "20"]])
+        warning_cell = "p1_t1_r1::p1_t1_c1"
+        snapshot.issues["warn"] = IssueState(
+            "warn", "warn", "ambiguous_column_assignment", "warning", "p1_t1",
+            [warning_cell], "active", "warning", "review",
+        )
+
+        result = TableFixerPipeline(MockClient([{"decisions": []}])).run_warnings(snapshot)
+
+        self.assertEqual(result.proposed_snapshot.issues["warn"].status, "active")
+        self.assertEqual(result.decisions[0].action, "invalid_warning_decision")
+        self.assertFalse(result.decisions[0].valid)
 
     def test_warning_context_overflow_creates_multiple_batches(self):
         snapshot = make_snapshot([[f"row {index}", str(index)] for index in range(8)])
