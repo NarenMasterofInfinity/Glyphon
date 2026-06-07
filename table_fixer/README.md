@@ -11,6 +11,22 @@ streamlit run table_fixer/app.py
 
 The app runs the existing parser, preserves parser diagnostics, and sends only compact phase-specific context to Ollama. Prompt contexts, raw responses, estimated `tiktoken` counts, native Ollama counts, decisions, lineage, and phase snapshots are available in the UI and audit export.
 
+For searchable PDFs, `text_parser.py` is a drop-in alternative that reads native PyMuPDF word boxes instead of
+running OCR, then reuses the same table construction and diagnostic logic:
+
+```python
+from pathlib import Path
+
+from table_fixer.pipeline import snapshot_from_parser
+from text_parser import parse_pdf_pages
+
+pages = parse_pdf_pages(Path("document.pdf").read_bytes(), page_numbers=[1])
+source_snapshot = snapshot_from_parser(pages)
+```
+
+Native text items and constructed cells retain PDF-coordinate bboxes. The parser emits the same warning/info
+diagnostic schema as the OCR parser and exposes the same table, assignment, issue, and diagnostic export helpers.
+
 The phase order is table reconciliation, metadata identification, header identification, structural-column
 repair, then remaining warning repair. Reconciliation runs first so an accidental parser split cannot hide
 a header fragment or cause a continuation segment to be stripped as metadata.
