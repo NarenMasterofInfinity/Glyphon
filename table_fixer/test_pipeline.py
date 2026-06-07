@@ -15,11 +15,11 @@ from table_fixer.models import (
     PromptUsage,
     RowState,
 )
-from table_fixer.ollama_client import OllamaLLMClient, StructuredResponse
+from table_fixer.ollama_client import OllamaClientError, OllamaLLMClient, StructuredResponse
 from table_fixer.pipeline import SYSTEM_PROMPTS, TableFixerPipeline, normalize_header_groups
 from table_fixer.repairs import apply_headers, decision
 from table_fixer.token_counting import TokenCounter
-from table_fixer.workspace import persist_snapshot
+from table_fixer.workspace import persist_llm_trace, persist_snapshot
 
 
 class MockClient:
@@ -185,6 +185,32 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(response.usage.native_output_tokens, 4)
         self.assertGreater(response.usage.input_tokens, 0)
         self.assertEqual(response.audit_record()["context"], {"row": "Title"})
+        self.assertEqual(client.prompt_attempts[0]["status"], "completed")
+        self.assertEqual(client.prompt_attempts[0]["raw_response"], '{"answer":"yes"}')
+        self.assertEqual(client.prompt_attempts[0]["parsed"], {"answer": "yes"})
+
+    def test_structured_client_preserves_prompt_when_call_returns_no_response(self):
+        client = OllamaLLMClient(model="mock")
+
+        def fail(_path, _payload):
+            raise OllamaClientError("Ollama unavailable")
+
+        client._post = fail
+        with self.assertRaises(OllamaClientError):
+            client.structured(
+                phase="warnings",
+                purpose="failed-warning",
+                system="Repair this row.",
+                context={"row": ["Alice", ""]},
+                schema={"type": "object"},
+            )
+
+        attempt = client.prompt_attempts[0]
+        self.assertEqual(attempt["status"], "failed")
+        self.assertEqual(attempt["system_prompt"], "Repair this row.")
+        self.assertEqual(attempt["context"], {"row": ["Alice", ""]})
+        self.assertIsNone(attempt["raw_response"])
+        self.assertEqual(attempt["error"], "Ollama unavailable")
 
     def test_workspace_snapshot_writes_json_and_table_csv(self):
         snapshot = make_snapshot([["Name", "Age"], ["Bob", "20"]])
@@ -194,6 +220,17 @@ class PipelineTests(unittest.TestCase):
             self.assertTrue((Path(directory) / "source" / "snapshot.json").exists())
             self.assertTrue((Path(directory) / "source" / "issues.json").exists())
             self.assertTrue((Path(directory) / "source" / "tables" / "p1_t1.csv").exists())
+
+    def test_workspace_writes_chronological_llm_trace(self):
+        trace = [
+            {"sequence": 1, "prompt_id": "prompt_1", "raw_response": None},
+            {"sequence": 2, "prompt_id": "prompt_2", "raw_response": "{}"},
+        ]
+        with TemporaryDirectory() as directory:
+            persist_llm_trace(Path(directory), trace)
+
+            saved = json.loads((Path(directory) / "llm_trace.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved, trace)
 
     def test_metadata_context_is_adaptive(self):
         structured = make_snapshot([["A", "B"]] + [[str(index), str(index + 1)] for index in range(1, 20)])

@@ -77,6 +77,10 @@ def persist_event(workspace: Path, phase: str, event: str) -> None:
     )
 
 
+def persist_llm_trace(workspace: Path, trace: list[dict[str, Any]]) -> None:
+    write_json(workspace / "llm_trace.json", trace)
+
+
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, ensure_ascii=True), encoding="utf-8")

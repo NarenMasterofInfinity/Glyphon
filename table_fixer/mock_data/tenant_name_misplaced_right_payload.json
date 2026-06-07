@@ -1,0 +1,40 @@
+{
+  "columns": [
+    "Unit No",
+    "Tenant Name",
+    "Date",
+    "Rent"
+  ],
+  "rows": [
+    ["101", "Raman, Aarthi", "18/12/2004", "12000"],
+    ["102", "", "Sithambar, Jegadheesh 20/12/2004", "13500"],
+    ["103", "Kumar, Priya", "22/12/2004", "11800"],
+    ["104", "Arul, Naveen", "24/12/2004", "14200"]
+  ],
+  "cell_issues": [
+    {
+      "issue_id": "r2_tenant_name_displaced_into_date",
+      "row": 2,
+      "column": 3,
+      "issue_type": "item_crosses_boundary",
+      "severity": "warning",
+      "explanation": "Tenant name is displaced into Date and merged with the actual date.",
+      "suggested_action": "Move the tenant name into Tenant Name and keep the date in Date.",
+      "evidence": {
+        "expected_headers": ["Tenant Name", "Date"]
+      }
+    },
+    {
+      "issue_id": "r2_tenant_name_assignment",
+      "row": 2,
+      "column": 3,
+      "issue_type": "ambiguous_column_assignment",
+      "severity": "warning",
+      "explanation": "Expected header: Tenant Name",
+      "suggested_action": "Keep the person name under Tenant Name and leave only the date under Date.",
+      "evidence": {
+        "expected_header": "Tenant Name"
+      }
+    }
+  ]
+}

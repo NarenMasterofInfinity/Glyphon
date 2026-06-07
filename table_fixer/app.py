@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
 import sys
@@ -21,6 +22,7 @@ from table_fixer.pipeline import PhaseRun, TableFixerPipeline, snapshot_from_par
 from table_fixer.workspace import (
     create_workspace,
     persist_event,
+    persist_llm_trace,
     persist_parser_results,
     persist_phase_run,
     persist_snapshot,
@@ -59,6 +61,7 @@ def initialize(file_key: str, source: PipelineSnapshot) -> None:
     st.session_state.fixer_file_key = file_key
     st.session_state.phase_snapshots = {"source": source}
     st.session_state.pending_runs = {}
+    st.session_state.llm_trace = []
     persist_snapshot(Path(st.session_state.table_fixer_workspace), "source", source)
 
 
@@ -110,6 +113,199 @@ def show_decisions(run: PhaseRun) -> None:
             st.markdown(f"**{response.usage.purpose}** (`{response.prompt_id}`)")
             st.json(response.context)
             st.code(response.raw_response or "", language="json")
+
+
+def append_llm_trace(
+    attempts: list[dict],
+    run: PhaseRun | None,
+    before: PipelineSnapshot,
+    *,
+    run_mode: str,
+    run_outcome: str,
+) -> None:
+    trace = st.session_state.setdefault("llm_trace", [])
+    decisions_by_prompt = {
+        record.prompt_id: record
+        for record in run.decisions
+        if record.prompt_id
+    } if run else {}
+    for attempt in attempts:
+        entry = deepcopy(attempt)
+        record = decisions_by_prompt.get(entry["prompt_id"])
+        entry["sequence"] = len(trace) + 1
+        entry["run_mode"] = run_mode
+        entry["run_outcome"] = run_outcome
+        entry["decision"] = record.__dict__ if record else None
+        entry["cell_changes"] = decision_cell_changes(before, run.proposed_snapshot, record) if run and record else []
+        trace.append(entry)
+    workspace = st.session_state.get("table_fixer_workspace")
+    if workspace:
+        persist_llm_trace(Path(workspace), trace)
+
+
+def decision_cell_changes(
+    before: PipelineSnapshot,
+    after: PipelineSnapshot,
+    record,
+) -> list[dict]:
+    cell_ids = set(record.affected_ids)
+    for key, value in record.payload.items():
+        if key.endswith("_cell_id") and isinstance(value, str):
+            cell_ids.add(value)
+        if key.endswith("_cell_ids") and isinstance(value, list):
+            cell_ids.update(item for item in value if isinstance(item, str))
+    cell_ids.update(
+        assignment["target_cell_id"]
+        for assignment in record.payload.get("assignments", [])
+        if isinstance(assignment, dict) and isinstance(assignment.get("target_cell_id"), str)
+    )
+    for cell_id in list(cell_ids):
+        if cell_id in after.cells:
+            cell_ids.update(after.cells[cell_id].ancestor_cell_ids)
+
+    changes = []
+    for cell_id in sorted(cell_ids):
+        before_cell = before.cells.get(cell_id)
+        after_cell = after.cells.get(cell_id)
+        before_text = before_cell.text if before_cell else None
+        after_text = after_cell.text if after_cell else None
+        if before_text == after_text:
+            continue
+        cell = after_cell or before_cell
+        table_id = before.rows[cell.row_id].table_id if cell.row_id in before.rows else after.rows[cell.row_id].table_id
+        table = after.tables.get(table_id) or before.tables.get(table_id)
+        changes.append({
+            "cell": cell_id,
+            "header": table.column_names.get(cell.column_id, cell.column_id) if table else cell.column_id,
+            "before": before_text,
+            "after": after_text,
+        })
+    return changes
+
+
+def show_llm_trace() -> None:
+    trace = st.session_state.get("llm_trace", [])
+    st.caption(
+        "Every LLM attempt in execution order, including previews, retries, invalid responses, and calls that failed "
+        "before returning a response."
+    )
+    if not trace:
+        st.info("No LLM calls have been made for this extraction yet.")
+        return
+
+    metrics = st.columns(4)
+    metrics[0].metric("LLM calls", len(trace))
+    metrics[1].metric(
+        "Needs attention",
+        sum(
+            item["status"] != "completed"
+            or bool(item.get("decision") and not item["decision"].get("applied"))
+            for item in trace
+        ),
+    )
+    metrics[2].metric("No response", sum(item.get("raw_response") is None for item in trace))
+    metrics[3].metric(
+        "Applied decisions",
+        sum(bool(item.get("decision") and item["decision"].get("applied")) for item in trace),
+    )
+
+    filter_columns = st.columns([2, 2, 3])
+    phases = list(dict.fromkeys(item["phase"] for item in trace))
+    selected_phase = filter_columns[0].selectbox(
+        "Phase",
+        ["All phases", *phases],
+        key="llm_trace_phases",
+    )
+    statuses = list(dict.fromkeys(item["status"] for item in trace))
+    selected_status = filter_columns[1].selectbox(
+        "Call status",
+        ["All statuses", *statuses],
+        key="llm_trace_statuses",
+    )
+    query = filter_columns[2].text_input(
+        "Search purpose, response, reason, or error",
+        key="llm_trace_query",
+    ).strip().lower()
+
+    filtered = []
+    for item in trace:
+        searchable = json.dumps(item, ensure_ascii=True).lower()
+        phase_matches = selected_phase == "All phases" or item["phase"] == selected_phase
+        status_matches = selected_status == "All statuses" or item["status"] == selected_status
+        if phase_matches and status_matches and query in searchable:
+            filtered.append(item)
+    st.caption(f"Showing {len(filtered)} of {len(trace)} calls.")
+    st.download_button(
+        "Download LLM trace JSON",
+        data=json.dumps(trace, indent=2, ensure_ascii=True),
+        file_name="glyphon_llm_trace.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    for item in filtered:
+        decision = item.get("decision")
+        impact = (
+            "applied"
+            if decision and decision.get("applied")
+            else "not applied"
+            if decision
+            else "no direct decision"
+        )
+        label = (
+            f"#{item['sequence']:03d} | {item['phase']} | {item['purpose']} | "
+            f"{item['status']} | {impact}"
+        )
+        expanded = item["status"] != "completed" or (decision is not None and not decision.get("applied"))
+        with st.expander(label, expanded=expanded):
+            summary = st.columns(5)
+            summary[0].metric("Call", f"#{item['sequence']:03d}")
+            summary[1].metric("Phase", item["phase"])
+            summary[2].metric("Status", item["status"])
+            summary[3].metric("Run", f"{item['run_mode']} / {item['run_outcome']}")
+            summary[4].metric("Applied", "Yes" if decision and decision.get("applied") else "No")
+
+            prompt_column, response_column = st.columns(2, gap="large")
+            with prompt_column:
+                st.markdown("**Prompt sent**")
+                st.caption("System instruction")
+                st.code(item["system_prompt"], language="text", wrap_lines=True)
+                st.caption("Context")
+                st.json(item["context"], expanded=True)
+                with st.expander("Supplied response format", expanded=False):
+                    st.json(item["schema"])
+            with response_column:
+                st.markdown("**Response received**")
+                if item.get("raw_response") is None:
+                    st.warning("None")
+                else:
+                    st.code(item["raw_response"], language="json", wrap_lines=True)
+                if item.get("parsed") is not None:
+                    st.caption("Parsed response")
+                    st.json(item["parsed"], expanded=True)
+                if item.get("error"):
+                    st.error(item["error"])
+                if item.get("validation_errors"):
+                    st.error("\n".join(item["validation_errors"]))
+
+                st.markdown("**Decision and table impact**")
+                if decision is None:
+                    st.info("No direct decision was created from this call.")
+                else:
+                    status = "Applied to table" if decision.get("applied") else "Did not change table"
+                    st.write(f"**{status}**")
+                    st.write(
+                        f"`{decision.get('action')}` | valid: `{decision.get('valid')}` | "
+                        f"confidence: `{decision.get('confidence')}`"
+                    )
+                    st.write(decision.get("reason") or "Reason: None")
+                    if decision.get("validation_errors"):
+                        st.error("\n".join(decision["validation_errors"]))
+                    if item.get("cell_changes"):
+                        st.caption("Observed cell changes")
+                        st.dataframe(pd.DataFrame(item["cell_changes"]), use_container_width=True, hide_index=True)
+                    with st.expander("Decision payload", expanded=False):
+                        st.json(decision.get("payload", {}))
 
 
 def show_cell_repairs(before: PipelineSnapshot, after: PipelineSnapshot, run: PhaseRun) -> None:
@@ -195,11 +391,36 @@ def execute_phase(phase: str, pipeline: TableFixerPipeline, auto_apply: bool) ->
     source = st.session_state.phase_snapshots[previous_phase(phase)]
     invalidate_from(phase)
     method = getattr(pipeline, f"run_{phase}")
+    attempt_start = len(pipeline.client.prompt_attempts)
+    run: PhaseRun | None = None
     try:
         run = method(source, auto_apply=auto_apply)
     except OllamaClientError as exc:
+        append_llm_trace(
+            pipeline.client.prompt_attempts[attempt_start:],
+            run,
+            source,
+            run_mode="auto-apply" if auto_apply else "preview",
+            run_outcome="failed",
+        )
         st.error(str(exc))
         return
+    except Exception:
+        append_llm_trace(
+            pipeline.client.prompt_attempts[attempt_start:],
+            run,
+            source,
+            run_mode="auto-apply" if auto_apply else "preview",
+            run_outcome="failed",
+        )
+        raise
+    append_llm_trace(
+        pipeline.client.prompt_attempts[attempt_start:],
+        run,
+        source,
+        run_mode="auto-apply" if auto_apply else "preview",
+        run_outcome="completed",
+    )
     if auto_apply:
         st.session_state.phase_snapshots[phase] = run.proposed_snapshot
         persist_phase_run(Path(st.session_state.table_fixer_workspace), phase, run, "auto_applied")
@@ -336,6 +557,7 @@ tabs = st.tabs([
     PHASE_LABELS["headers"],
     PHASE_LABELS["columns"],
     PHASE_LABELS["warnings"],
+    "LLM Trace",
     "Final & Audit",
 ])
 
@@ -397,6 +619,9 @@ with tabs[5]:
         )
 
 with tabs[6]:
+    show_llm_trace()
+
+with tabs[7]:
     final = current_final_snapshot()
     show_tables(final)
     st.subheader("Decision audit")

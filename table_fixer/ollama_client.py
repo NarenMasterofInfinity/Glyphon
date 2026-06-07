@@ -5,6 +5,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -52,6 +53,7 @@ class OllamaLLMClient:
     base_url: str = "http://localhost:11434"
     timeout: float = 120.0
     token_counter: TokenCounter = field(default_factory=TokenCounter)
+    prompt_attempts: list[dict[str, Any]] = field(default_factory=list)
 
     def _post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         url = f"{self.base_url.rstrip('/')}{path}"
@@ -81,20 +83,44 @@ class OllamaLLMClient:
     ) -> StructuredResponse:
         prompt_id = f"prompt_{uuid4().hex[:12]}"
         context_text = json.dumps(context, ensure_ascii=True, separators=(",", ":"))
+        attempt = {
+            "prompt_id": prompt_id,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+            "phase": phase,
+            "purpose": purpose,
+            "model": self.model,
+            "system_prompt": system,
+            "context": context,
+            "schema": schema,
+            "repair_parent_prompt_id": repair_parent_prompt_id,
+            "status": "pending",
+            "raw_response": None,
+            "parsed": None,
+            "validation_errors": [],
+            "error": None,
+            "usage": None,
+        }
+        self.prompt_attempts.append(attempt)
         started = time.perf_counter()
-        response = self._post(
-            "/api/chat",
-            {
-                "model": self.model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": context_text},
-                ],
-                "format": schema,
-                "stream": False,
-                "options": {"temperature": 0, "num_predict": 768},
-            },
-        )
+        try:
+            response = self._post(
+                "/api/chat",
+                {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": context_text},
+                    ],
+                    "format": schema,
+                    "stream": False,
+                    "options": {"temperature": 0, "num_predict": 768},
+                },
+            )
+        except Exception as exc:
+            attempt["status"] = "failed"
+            attempt["error"] = str(exc)
+            attempt["duration_ms"] = round((time.perf_counter() - started) * 1000, 2)
+            raise
         duration_ms = (time.perf_counter() - started) * 1000
         raw = response.get("message", {}).get("content", "")
         parsed = None
@@ -124,6 +150,14 @@ class OllamaLLMClient:
             native_output_tokens=response.get("eval_count"),
             repair_parent_prompt_id=repair_parent_prompt_id,
         )
+        attempt.update({
+            "status": "invalid_response" if errors else "completed",
+            "raw_response": raw or None,
+            "parsed": parsed,
+            "validation_errors": list(errors),
+            "usage": usage.__dict__,
+            "duration_ms": round(duration_ms, 2),
+        })
         return StructuredResponse(
             prompt_id,
             parsed,
