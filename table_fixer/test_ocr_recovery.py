@@ -69,6 +69,47 @@ class OCRRecoveryTests(unittest.TestCase):
         self.assertEqual(source.cells[target].text, "")
         self.assertTrue(recovery.snapshot.decisions[0].applied)
 
+    def test_merges_fragmented_letter_before_recognition(self):
+        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
+        fragments = [
+            GlyphComponent(1, (178.0, 10.0, 180.0, 15.0), 8.0),
+            GlyphComponent(1, (178.2, 16.0, 180.2, 18.0), 4.0),
+        ]
+        crop_widths = []
+
+        def recognize(crop):
+            crop_widths.append(crop.width)
+            return "i", 0.96
+
+        recovery = recover_missed_glyphs_with_result(
+            b"",
+            pages,
+            source,
+            recognizer=recognize,
+            component_detector=detector_for(fragments),
+            page_images=self.image,
+        )
+        self.assertEqual(recovery.snapshot.cells["p1_t1_r1::p1_t1_c2"].text, "i")
+        self.assertEqual(len(recovery.candidates), 1)
+        self.assertEqual(len(crop_widths), 2)
+
+    def test_rejects_multiple_plausible_blobs_in_one_empty_cell(self):
+        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
+        blobs = [
+            GlyphComponent(1, (150.0, 10.0, 156.0, 18.0), 20.0),
+            GlyphComponent(1, (180.0, 10.0, 186.0, 18.0), 20.0),
+        ]
+        recovery = recover_missed_glyphs_with_result(
+            b"",
+            pages,
+            source,
+            recognizer=lambda _crop: ("i", 0.96),
+            component_detector=detector_for(blobs),
+            page_images=self.image,
+        )
+        self.assertEqual(recovery.snapshot.cells["p1_t1_r1::p1_t1_c2"].text, "")
+        self.assertTrue(all(candidate.rejection_reason == "multiple_plausible_glyphs_in_empty_cell" for candidate in recovery.candidates))
+
     def test_inserts_supported_missing_column_without_disturbing_existing_cells(self):
         source, pages = make_source([["A", "D"], ["B", "E"], ["C", "F"]], [20.0, 180.0])
         components = [

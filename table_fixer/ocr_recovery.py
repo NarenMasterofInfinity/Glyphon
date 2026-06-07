@@ -149,18 +149,20 @@ def detect_glyph_components(image: Image.Image, page_number: int, dpi: int = REC
 def _rapidocr_recognizer() -> Recognizer:
     from rapidocr_onnxruntime import RapidOCR
 
-    engine = RapidOCR()
+    # These permissive detector settings are confined to a tiny recovery crop.
+    # The page-wide parser continues to use its unchanged default OCR settings.
+    engine = RapidOCR(det_db_thresh=0.12, det_db_box_thresh=0.20, text_score=0.0)
 
     def recognize(image: Image.Image) -> tuple[str, float]:
-        result, _ = engine(np.asarray(image), use_det=False, use_cls=False, use_rec=True)
-        if not result:
+        result, _ = engine(np.asarray(image), use_det=True, use_cls=False, use_rec=True)
+        if not result or len(result) != 1:
             return "", 0.0
         first = result[0] if isinstance(result, list) else result
         if isinstance(first, (list, tuple)) and len(first) >= 2:
-            if isinstance(first[0], str):
-                return str(first[0]).strip(), float(first[1])
             if len(first) >= 3 and isinstance(first[1], str):
                 return str(first[1]).strip(), float(first[2])
+            if isinstance(first[0], str):
+                return str(first[0]).strip(), float(first[1])
         return "", 0.0
 
     return recognize
@@ -254,7 +256,8 @@ def _column_lanes(
 
 def _candidate_crop(component: GlyphComponent, row_band: tuple[float, float]) -> tuple[float, float, float, float]:
     width = component.bbox[2] - component.bbox[0]
-    padding = max(2.0, width * 0.8)
+    height = component.bbox[3] - component.bbox[1]
+    padding = max(2.0, width * 0.8, height * 0.35)
     return (
         component.bbox[0] - padding,
         max(row_band[0], component.bbox[1] - padding),
@@ -271,6 +274,55 @@ def _cluster_components(components: list[tuple[str, GlyphComponent]], tolerance:
         else:
             clusters[-1].append(entry)
     return clusters
+
+
+def _union_components(page_number: int, components: list[GlyphComponent]) -> GlyphComponent:
+    return GlyphComponent(
+        page_number=page_number,
+        bbox=(
+            min(component.bbox[0] for component in components),
+            min(component.bbox[1] for component in components),
+            max(component.bbox[2] for component in components),
+            max(component.bbox[3] for component in components),
+        ),
+        area=sum(component.area for component in components),
+    )
+
+
+def _merge_glyph_fragments(
+    entries: list[tuple[str, GlyphComponent]],
+    row_bands: dict[str, tuple[float, float]],
+) -> list[tuple[str, GlyphComponent]]:
+    """Merge detached strokes/dots into compact row-local glyph blobs."""
+    merged: list[tuple[str, GlyphComponent]] = []
+    by_row: dict[str, list[GlyphComponent]] = {}
+    for row_id, component in entries:
+        by_row.setdefault(row_id, []).append(component)
+    for row_id, components in by_row.items():
+        row_height = row_bands[row_id][1] - row_bands[row_id][0]
+        groups: list[list[GlyphComponent]] = []
+        for component in sorted(components, key=lambda value: value.bbox[0]):
+            best_group: list[GlyphComponent] | None = None
+            best_distance = float("inf")
+            for group in groups:
+                union = _union_components(component.page_number, group)
+                horizontal_gap = max(0.0, component.bbox[0] - union.bbox[2], union.bbox[0] - component.bbox[2])
+                vertical_gap = max(0.0, component.bbox[1] - union.bbox[3], union.bbox[1] - component.bbox[3])
+                combined_width = max(union.bbox[2], component.bbox[2]) - min(union.bbox[0], component.bbox[0])
+                if (
+                    horizontal_gap <= max(2.5, row_height * 0.18)
+                    and vertical_gap <= max(3.0, row_height * 0.35)
+                    and combined_width <= max(8.0, row_height * 0.9)
+                    and horizontal_gap + vertical_gap < best_distance
+                ):
+                    best_group = group
+                    best_distance = horizontal_gap + vertical_gap
+            if best_group is None:
+                groups.append([component])
+            else:
+                best_group.append(component)
+        merged.extend((row_id, _union_components(group[0].page_number, group)) for group in groups)
+    return merged
 
 
 def recover_missed_glyphs(
@@ -334,7 +386,9 @@ def recover_missed_glyphs_with_result(
                 continue
             unmatched.append((row_id, component))
 
+        unmatched = _merge_glyph_fragments(unmatched, bands)
         consumed: set[int] = set()
+        empty_cell_candidates: dict[str, list[tuple[int, RecoveryCandidate, GlyphComponent]]] = {}
         for index, (row_id, component) in enumerate(unmatched):
             column_id = next((column_id for column_id, lane in lanes.items() if lane[0] <= component.cx <= lane[1]), None)
             target_id = f"{row_id}::{column_id}" if column_id else None
@@ -352,7 +406,20 @@ def recover_missed_glyphs_with_result(
                 evidence={"kind": "existing_empty_cell", "component_bbox": component.bbox},
             )
             _recognize_candidate(candidate, image, recognizer, dpi)
+            candidates.append(candidate)
             if candidate.recognized_text:
+                empty_cell_candidates.setdefault(target_id, []).append((index, candidate, component))
+
+        for target_id, plausible in empty_cell_candidates.items():
+            target = result.cells[target_id]
+            if len(plausible) != 1:
+                for index, candidate, _ in plausible:
+                    candidate.recognized_text = None
+                    candidate.rejection_reason = "multiple_plausible_glyphs_in_empty_cell"
+                    consumed.add(index)
+                continue
+            index, candidate, component = plausible[0]
+            if not target.text.strip():
                 target.text = candidate.recognized_text
                 target.bbox = component.bbox
                 target.assignment_score = candidate.confidence
@@ -360,7 +427,6 @@ def recover_missed_glyphs_with_result(
                 consumed.add(index)
                 recovered_cells += 1
                 _record_recovery(result, candidate, "recover_empty_cell", [target_id])
-            candidates.append(candidate)
 
         remaining = [entry for index, entry in enumerate(unmatched) if index not in consumed]
         row_heights = [bottom - top for top, bottom in bands.values()]
