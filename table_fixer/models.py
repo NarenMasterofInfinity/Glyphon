@@ -115,6 +115,7 @@ class PipelineSnapshot:
     decisions: list[DecisionRecord] = field(default_factory=list)
     prompt_usage: list[PromptUsage] = field(default_factory=list)
     prompt_audits: list[dict[str, Any]] = field(default_factory=list)
+    recovery_audits: list[dict[str, Any]] = field(default_factory=list)
     row_lineage: dict[str, list[str]] = field(default_factory=dict)
     column_lineage: dict[str, list[str]] = field(default_factory=dict)
     cell_lineage: dict[str, list[str]] = field(default_factory=dict)

@@ -43,6 +43,7 @@ def persist_snapshot(workspace: Path, label: str, snapshot: PipelineSnapshot) ->
     write_json(target / "decisions.json", [decision.__dict__ for decision in snapshot.decisions])
     write_json(target / "prompt_usage.json", [usage.__dict__ for usage in snapshot.prompt_usage])
     write_json(target / "prompt_audits.json", snapshot.prompt_audits)
+    write_json(target / "ocr_recovery.json", snapshot.recovery_audits)
     write_json(target / "metadata_rows.json", rows_by_role(snapshot, "metadata"))
     write_json(target / "header_rows.json", rows_by_role(snapshot, "header"))
     for table_id in snapshot.tables:

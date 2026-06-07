@@ -18,6 +18,7 @@ from parser import parse_pdf_pages
 from table_fixer.export import excel_export, json_export, rows_by_role, table_records
 from table_fixer.models import PipelineSnapshot
 from table_fixer.ollama_client import OllamaClientError, OllamaLLMClient
+from table_fixer.ocr_recovery import recover_missed_glyphs
 from table_fixer.pipeline import PhaseRun, TableFixerPipeline, snapshot_from_parser
 from table_fixer.workspace import (
     create_workspace,
@@ -45,6 +46,14 @@ PHASE_LABELS = {
 @st.cache_data(show_spinner=False)
 def parse_upload(pdf_bytes: bytes, page_numbers: tuple[int, ...]):
     return parse_pdf_pages(pdf_bytes, page_numbers=list(page_numbers))
+
+
+@st.cache_data(show_spinner=False)
+def recover_upload(pdf_bytes: bytes, page_numbers: tuple[int, ...]):
+    page_results = parse_upload(pdf_bytes, page_numbers)
+    source = snapshot_from_parser(page_results)
+    recovered_source = recover_missed_glyphs(pdf_bytes, page_results, source)
+    return page_results, recovered_source
 
 
 @st.cache_data(show_spinner=False)
@@ -535,10 +544,9 @@ if not st.session_state.table_fixer_extraction_request.get("submitted"):
 selected_pages = st.session_state.table_fixer_extraction_request.get("selected_pages", [])
 st.session_state.table_fixer_workspace = st.session_state.table_fixer_extraction_request["workspace"]
 active_page_numbers = tuple(selected_pages or all_page_numbers)
-with st.spinner("Running parser..."):
-    page_results = parse_upload(pdf_bytes, active_page_numbers)
+with st.spinner("Running parser and targeted OCR recovery..."):
+    page_results, source_snapshot = recover_upload(pdf_bytes, active_page_numbers)
 persist_parser_results(Path(st.session_state.table_fixer_workspace), page_results)
-source_snapshot = snapshot_from_parser(page_results)
 initialize(file_key, source_snapshot)
 
 client = OllamaLLMClient(model=model, base_url=base_url)
@@ -563,10 +571,27 @@ tabs = st.tabs([
 
 with tabs[0]:
     source = st.session_state.phase_snapshots["source"]
+    recovery_decisions = [record for record in source.decisions if record.phase == "ocr_recovery" and record.applied]
+    recovery_metrics = st.columns(3)
+    recovery_metrics[0].metric(
+        "Recovered cells",
+        sum(record.action == "recover_empty_cell" for record in recovery_decisions)
+        + sum(int(record.payload.get("recovered_values", 0)) for record in recovery_decisions if record.action == "insert_recovered_column"),
+    )
+    recovery_metrics[1].metric(
+        "Recovered columns",
+        sum(record.action == "insert_recovered_column" for record in recovery_decisions),
+    )
+    recovery_metrics[2].metric(
+        "Rejected candidates",
+        sum(not candidate.get("accepted", False) for candidate in source.recovery_audits),
+    )
     show_tables(source)
+    with st.expander("Targeted OCR recovery audit", expanded=False):
+        st.dataframe(pd.DataFrame(source.recovery_audits), use_container_width=True, height=300)
     st.subheader("Cells with bbox, warnings, and lineage")
     st.dataframe(pd.DataFrame([cell.__dict__ for cell in source.cells.values()]), use_container_width=True, height=360)
-    st.subheader("Original parser diagnostics")
+    st.subheader("Parser and recovery diagnostics")
     st.dataframe(pd.DataFrame([issue.__dict__ for issue in source.issues.values()]), use_container_width=True, height=300)
 
 with tabs[1]:

@@ -11,6 +11,10 @@ streamlit run table_fixer/app.py
 
 The app runs the existing parser, preserves parser diagnostics, and sends only compact phase-specific context to Ollama. Prompt contexts, raw responses, estimated `tiktoken` counts, native Ollama counts, decisions, lineage, and phase snapshots are available in the UI and audit export.
 
+Before the five repair phases, a deterministic targeted OCR recovery pass inspects unmatched small glyphs in
+otherwise parsed table regions. It can fill only empty cells or add a new placeholder column supported across
+multiple rows. It never overwrites existing text, moves rows, or changes existing column IDs.
+
 The phase order is table reconciliation, metadata identification, header identification, structural-column
 repair, then remaining warning repair. Reconciliation runs first so an accidental parser split cannot hide
 a header fragment or cause a continuation segment to be stripped as metadata.
