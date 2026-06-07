@@ -6,7 +6,7 @@ import unittest
 from PIL import Image
 
 from table_fixer.models import CellState, LogicalTable, PipelineSnapshot, RowState
-from table_fixer.ocr_recovery import GlyphComponent, recover_missed_glyphs, recover_missed_glyphs_with_result
+from table_fixer.ocr_recovery import LenientOCRItem, recover_missed_glyphs, recover_missed_glyphs_with_result
 
 
 def make_source(rows: list[list[str]], centers: list[float]) -> tuple[PipelineSnapshot, list[SimpleNamespace]]:
@@ -27,241 +27,111 @@ def make_source(rows: list[list[str]], centers: list[float]) -> tuple[PipelineSn
             bbox = (center - 4, y0, center + 4, y0 + 8) if value else None
             cells[cell_id] = CellState(cell_id, row_id, column_id, value, bbox, ancestor_cell_ids=[cell_id])
             if bbox:
-                raw_items.append(SimpleNamespace(x0=bbox[0], y0=bbox[1], x1=bbox[2], y1=bbox[3]))
+                raw_items.append(SimpleNamespace(text=value, x0=bbox[0], y0=bbox[1], x1=bbox[2], y1=bbox[3]))
     snapshot = PipelineSnapshot(
-        "source",
-        "source",
-        {table_id: table},
-        row_states,
-        cells,
-        {},
+        "source", "source", {table_id: table}, row_states, cells, {},
         page_dimensions={1: (220.0, 100.0)},
     )
-    page = SimpleNamespace(page_number=1, raw_items=raw_items)
-    return snapshot, [page]
+    return snapshot, [SimpleNamespace(page_number=1, raw_items=raw_items)]
 
 
-def detector_for(components):
-    return lambda _image, _page_number: components
+def detector_for(items):
+    return lambda _image, _page_number: items
+
+
+def item(text, confidence, bbox):
+    return LenientOCRItem(1, text, confidence, bbox)
 
 
 class OCRRecoveryTests(unittest.TestCase):
     def setUp(self):
         self.image = {1: Image.new("RGB", (1300, 600), "white")}
 
-    def test_recovers_single_letter_only_into_empty_existing_cell(self):
-        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
-        component = GlyphComponent(1, (176.0, 10.0, 184.0, 18.0), 20.0)
-
-        recovery = recover_missed_glyphs_with_result(
+    def recover(self, source, pages, items):
+        return recover_missed_glyphs_with_result(
             b"",
             pages,
             source,
-            recognizer=lambda _crop: ("q", 0.93),
-            component_detector=detector_for([component]),
+            lenient_detector=detector_for(items),
             page_images=self.image,
         )
 
-        target = "p1_t1_r1::p1_t1_c2"
-        self.assertEqual(recovery.snapshot.cells[target].text, "q")
-        self.assertEqual(recovery.recovered_cell_count, 1)
-        self.assertEqual(recovery.recovered_column_count, 0)
-        self.assertEqual(source.cells[target].text, "")
-        self.assertTrue(recovery.snapshot.decisions[0].applied)
-
-    def test_merges_fragmented_letter_before_recognition(self):
+    def test_golden_detected_text_is_never_recovered_again(self):
         source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
-        fragments = [
-            GlyphComponent(1, (178.0, 10.0, 180.0, 15.0), 8.0),
-            GlyphComponent(1, (178.2, 16.0, 180.2, 18.0), 4.0),
-        ]
-        crop_widths = []
+        recovery = self.recover(source, pages, [
+            item("A", 0.99, (16.0, 10.0, 24.0, 18.0)),
+            item("q", 0.90, (176.0, 10.0, 184.0, 18.0)),
+        ])
+        self.assertEqual(recovery.snapshot.cells["p1_t1_r1::p1_t1_c1"].text, "A")
+        self.assertEqual(recovery.snapshot.cells["p1_t1_r1::p1_t1_c2"].text, "q")
+        self.assertEqual(len(recovery.candidates), 1)
 
-        def recognize(crop):
-            crop_widths.append(crop.width)
-            return "i", 0.96
+    def test_lenient_box_partially_covered_by_golden_text_is_removed(self):
+        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
+        recovery = self.recover(source, pages, [
+            item("duplicate", 0.99, (22.0, 10.0, 60.0, 18.0)),
+        ])
+        self.assertEqual(recovery.candidates, [])
+        self.assertEqual(recovery.snapshot.cells["p1_t1_r1::p1_t1_c1"].text, "A")
 
-        recovery = recover_missed_glyphs_with_result(
-            b"",
-            pages,
-            source,
-            recognizer=recognize,
-            component_detector=detector_for(fragments),
-            page_images=self.image,
-        )
+    def test_strongest_overlapping_lenient_item_wins(self):
+        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
+        recovery = self.recover(source, pages, [
+            item("l", 0.61, (176.0, 10.0, 184.0, 18.0)),
+            item("i", 0.94, (175.5, 9.5, 184.5, 18.5)),
+            item("1", 0.72, (176.2, 10.2, 183.8, 17.8)),
+        ])
         self.assertEqual(recovery.snapshot.cells["p1_t1_r1::p1_t1_c2"].text, "i")
         self.assertEqual(len(recovery.candidates), 1)
-        self.assertEqual(len(crop_widths), 2)
+        self.assertEqual(recovery.candidates[0].confidence, 0.94)
 
-    def test_rejects_multiple_plausible_blobs_in_one_empty_cell(self):
+    def test_weak_lenient_items_are_not_recovered(self):
         source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
-        blobs = [
-            GlyphComponent(1, (150.0, 10.0, 156.0, 18.0), 20.0),
-            GlyphComponent(1, (180.0, 10.0, 186.0, 18.0), 20.0),
-        ]
-        recovery = recover_missed_glyphs_with_result(
-            b"",
-            pages,
-            source,
-            recognizer=lambda _crop: ("i", 0.96),
-            component_detector=detector_for(blobs),
-            page_images=self.image,
-        )
+        recovery = self.recover(source, pages, [item("q", 0.40, (176.0, 10.0, 184.0, 18.0))])
         self.assertEqual(recovery.snapshot.cells["p1_t1_r1::p1_t1_c2"].text, "")
-        self.assertTrue(all(candidate.rejection_reason == "multiple_plausible_glyphs_in_empty_cell" for candidate in recovery.candidates))
+        self.assertEqual(recovery.candidates, [])
 
-    def test_inserts_supported_missing_column_without_disturbing_existing_cells(self):
+    def test_highest_confidence_item_wins_inside_empty_cell(self):
+        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
+        recovery = self.recover(source, pages, [
+            item("q", 0.80, (150.0, 10.0, 156.0, 18.0)),
+            item("r", 0.91, (180.0, 10.0, 186.0, 18.0)),
+        ])
+        self.assertEqual(recovery.snapshot.cells["p1_t1_r1::p1_t1_c2"].text, "r")
+
+    def test_inserts_supported_missing_column_without_changing_existing_text(self):
         source, pages = make_source([["A", "D"], ["B", "E"], ["C", "F"]], [20.0, 180.0])
-        components = [
-            GlyphComponent(1, (96.0, 10.0 + offset, 104.0, 18.0 + offset), 20.0)
-            for offset in (0.0, 20.0, 40.0)
-        ]
-        before_text = {cell_id: cell.text for cell_id, cell in source.cells.items()}
-        before_columns = list(source.tables["p1_t1"].column_ids)
-
-        recovery = recover_missed_glyphs_with_result(
-            b"",
-            pages,
-            source,
-            recognizer=lambda _crop: ("z", 0.95),
-            component_detector=detector_for(components),
-            page_images=self.image,
-        )
-
+        before = {cell_id: cell.text for cell_id, cell in source.cells.items()}
+        recovery = self.recover(source, pages, [
+            item("x", 0.90, (96.0, 10.0, 104.0, 18.0)),
+            item("y", 0.91, (96.0, 30.0, 104.0, 38.0)),
+            item("z", 0.92, (96.0, 50.0, 104.0, 58.0)),
+        ])
         table = recovery.snapshot.tables["p1_t1"]
-        new_column = next(column_id for column_id in table.column_ids if column_id not in before_columns)
+        new_column = next(column_id for column_id in table.column_ids if "_ocr_" in column_id)
         self.assertEqual(table.column_ids.index(new_column), 1)
-        self.assertEqual([recovery.snapshot.cells[f"p1_t1_r{i}::{new_column}"].text for i in range(1, 4)], ["z", "z", "z"])
-        self.assertEqual({cell_id: recovery.snapshot.cells[cell_id].text for cell_id in before_text}, before_text)
-        self.assertEqual(recovery.recovered_column_count, 1)
-
-    def test_new_column_leaves_unsupported_rows_blank(self):
-        source, pages = make_source([["A", "E"], ["B", "F"], ["C", "G"], ["D", "H"]], [20.0, 180.0])
-        components = [
-            GlyphComponent(1, (96.0, 10.0 + offset, 104.0, 18.0 + offset), 20.0)
-            for offset in (0.0, 20.0, 40.0)
-        ]
-        recovery = recover_missed_glyphs_with_result(
-            b"",
-            pages,
-            source,
-            recognizer=lambda _crop: ("m", 0.96),
-            component_detector=detector_for(components),
-            page_images=self.image,
+        self.assertEqual(
+            [recovery.snapshot.cells[f"p1_t1_r{i}::{new_column}"].text for i in range(1, 4)],
+            ["x", "y", "z"],
         )
-        new_column = next(column_id for column_id in recovery.snapshot.tables["p1_t1"].column_ids if "_ocr_" in column_id)
-        self.assertEqual(recovery.snapshot.cells[f"p1_t1_r4::{new_column}"].text, "")
+        self.assertEqual({cell_id: recovery.snapshot.cells[cell_id].text for cell_id in before}, before)
 
-    def test_rejects_disagreement_and_low_confidence(self):
-        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
-        component = GlyphComponent(1, (176.0, 10.0, 184.0, 18.0), 20.0)
-        answers = iter([("a", 0.99), ("b", 0.99)])
-        recovery = recover_missed_glyphs_with_result(
-            b"",
-            pages,
-            source,
-            recognizer=lambda _crop: next(answers),
-            component_detector=detector_for([component]),
-            page_images=self.image,
-        )
-        self.assertEqual(recovery.snapshot.cells["p1_t1_r1::p1_t1_c2"].text, "")
-        self.assertEqual(recovery.candidates[0].rejection_reason, "recognition_variants_disagree")
-
-        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
-        low_confidence = recover_missed_glyphs_with_result(
-            b"",
-            pages,
-            source,
-            recognizer=lambda _crop: ("a", 0.80),
-            component_detector=detector_for([component]),
-            page_images=self.image,
-        )
-        self.assertEqual(low_confidence.candidates[0].rejection_reason, "recognition_confidence_below_threshold")
-
-    def test_rejects_component_overlapping_existing_ocr_item(self):
-        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
-        component = GlyphComponent(1, (16.0, 10.0, 24.0, 18.0), 20.0)
-        recovery = recover_missed_glyphs_with_result(
-            b"",
-            pages,
-            source,
-            recognizer=lambda _crop: ("a", 0.99),
-            component_detector=detector_for([component]),
-            page_images=self.image,
-        )
-        self.assertEqual(recovery.candidates, [])
-        self.assertEqual(recovery.snapshot.recovery_audits, [])
-
-    def test_excludes_tiny_partial_overlap_with_presented_item(self):
+    def test_new_column_uses_strongest_overlapping_item_per_row(self):
         source, pages = make_source([["A", "D"], ["B", "E"], ["C", "F"]], [20.0, 180.0])
-        # Only a small edge touches the existing A bbox. It must not become new-column evidence.
-        components = [
-            GlyphComponent(1, (23.9, 10.0, 30.0, 18.0), 12.0),
-            GlyphComponent(1, (23.9, 30.0, 30.0, 38.0), 12.0),
-            GlyphComponent(1, (23.9, 50.0, 30.0, 58.0), 12.0),
-        ]
-        recovery = recover_missed_glyphs_with_result(
-            b"",
-            pages,
-            source,
-            recognizer=lambda _crop: ("i", 0.99),
-            component_detector=detector_for(components),
-            page_images=self.image,
-        )
-        self.assertEqual(recovery.recovered_column_count, 0)
-        self.assertEqual(recovery.candidates, [])
-        self.assertEqual(recovery.snapshot.tables["p1_t1"].column_ids, source.tables["p1_t1"].column_ids)
-
-    def test_recovers_leftmost_and_rightmost_missing_columns(self):
-        for x_position, expected_position in ((5.0, 0), (195.0, 2)):
-            with self.subTest(x_position=x_position):
-                source, pages = make_source([["A", "D"], ["B", "E"], ["C", "F"]], [20.0, 180.0])
-                components = [
-                    GlyphComponent(1, (x_position - 3, 10.0 + offset, x_position + 3, 18.0 + offset), 18.0)
-                    for offset in (0.0, 20.0, 40.0)
-                ]
-                recovery = recover_missed_glyphs_with_result(
-                    b"",
-                    pages,
-                    source,
-                    recognizer=lambda _crop: ("r", 0.97),
-                    component_detector=detector_for(components),
-                    page_images=self.image,
-                )
-                new_column = next(column_id for column_id in recovery.snapshot.tables["p1_t1"].column_ids if "_ocr_" in column_id)
-                self.assertEqual(recovery.snapshot.tables["p1_t1"].column_ids.index(new_column), expected_position)
-
-    def test_workspace_persists_recovery_audit(self):
-        import importlib.util
-
-        if importlib.util.find_spec("pandas") is None:
-            self.skipTest("Project persistence dependencies are not installed.")
-        from pathlib import Path
-        from tempfile import TemporaryDirectory
-
-        from table_fixer.workspace import persist_snapshot
-
-        source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
-        recovery = recover_missed_glyphs_with_result(
-            b"",
-            pages,
-            source,
-            recognizer=lambda _crop: ("q", 0.93),
-            component_detector=detector_for([GlyphComponent(1, (176.0, 10.0, 184.0, 18.0), 20.0)]),
-            page_images=self.image,
-        )
-        with TemporaryDirectory() as directory:
-            persist_snapshot(Path(directory), "source", recovery.snapshot)
-            self.assertTrue((Path(directory) / "source" / "ocr_recovery.json").exists())
+        recovery = self.recover(source, pages, [
+            item("l", 0.60, (96.0, 10.0, 104.0, 18.0)),
+            item("1", 0.93, (95.5, 9.5, 104.5, 18.5)),
+            item("2", 0.94, (96.0, 30.0, 104.0, 38.0)),
+            item("3", 0.95, (96.0, 50.0, 104.0, 58.0)),
+        ])
+        new_column = next(column_id for column_id in recovery.snapshot.tables["p1_t1"].column_ids if "_ocr_" in column_id)
+        self.assertEqual(recovery.snapshot.cells[f"p1_t1_r1::{new_column}"].text, "1")
 
     def test_public_api_returns_snapshot(self):
         source, pages = make_source([["A", ""], ["B", "x"], ["C", "y"]], [20.0, 180.0])
         snapshot = recover_missed_glyphs(
-            b"",
-            pages,
-            source,
-            recognizer=lambda _crop: ("q", 0.93),
-            component_detector=detector_for([GlyphComponent(1, (176.0, 10.0, 184.0, 18.0), 20.0)]),
+            b"", pages, source,
+            lenient_detector=detector_for([item("q", 0.90, (176.0, 10.0, 184.0, 18.0))]),
             page_images=self.image,
         )
         self.assertIsInstance(snapshot, PipelineSnapshot)

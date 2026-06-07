@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
-from math import ceil, floor
+from math import ceil
 import re
 from statistics import median
 from typing import Any, Callable
@@ -14,15 +14,18 @@ from .context import ensure_profiles
 from .models import CellState, DecisionRecord, IssueState, PipelineSnapshot
 
 
-MIN_RECOGNITION_CONFIDENCE = 0.85
 RECOVERY_DPI = 400
+MIN_RECOVERY_CONFIDENCE = 0.50
+GOLDEN_COVERAGE_THRESHOLD = 0.0
+LENIENT_OVERLAP_THRESHOLD = 0.35
 
 
 @dataclass
-class GlyphComponent:
+class LenientOCRItem:
     page_number: int
+    text: str
+    confidence: float
     bbox: tuple[float, float, float, float]
-    area: float
 
     @property
     def cx(self) -> float:
@@ -37,15 +40,13 @@ class GlyphComponent:
 class RecoveryCandidate:
     candidate_id: str
     page_number: int
-    table_id: str
-    row_id: str
-    proposed_x: float
-    crop_bbox: tuple[float, float, float, float]
+    table_id: str | None
+    row_id: str | None
+    text: str
+    confidence: float
+    bbox: tuple[float, float, float, float]
     target_cell_id: str | None = None
     proposed_column_id: str | None = None
-    recognition_variants: list[dict[str, Any]] = field(default_factory=list)
-    recognized_text: str | None = None
-    confidence: float = 0.0
     accepted: bool = False
     rejection_reason: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
@@ -60,37 +61,35 @@ class RecoveryResult:
     rejected_candidate_count: int
 
 
-Recognizer = Callable[[Image.Image], tuple[str, float]]
-ComponentDetector = Callable[[Image.Image, int], list[GlyphComponent]]
+LenientDetector = Callable[[Image.Image, int], list[LenientOCRItem]]
 
 
-def _overlap_ratio(
+def _area(bbox: tuple[float, float, float, float]) -> float:
+    return max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+
+
+def _intersection_area(
     left: tuple[float, float, float, float],
     right: tuple[float, float, float, float],
 ) -> float:
-    width = max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
-    height = max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
-    intersection = width * height
-    left_area = max((left[2] - left[0]) * (left[3] - left[1]), 1e-6)
-    return intersection / left_area
-
-
-def _expand_bbox(
-    bbox: tuple[float, float, float, float],
-    margin: float,
-) -> tuple[float, float, float, float]:
-    return (bbox[0] - margin, bbox[1] - margin, bbox[2] + margin, bbox[3] + margin)
-
-
-def _overlaps_presented_item(
-    component: GlyphComponent,
-    presented_boxes: list[tuple[float, float, float, float]],
-) -> bool:
-    """Fail closed: any contact with an existing presented item excludes recovery."""
-    return any(
-        _overlap_ratio(component.bbox, _expand_bbox(box, 1.5)) > 0
-        for box in presented_boxes
+    return (
+        max(0.0, min(left[2], right[2]) - max(left[0], right[0]))
+        * max(0.0, min(left[3], right[3]) - max(left[1], right[1]))
     )
+
+
+def _coverage(
+    candidate: tuple[float, float, float, float],
+    other: tuple[float, float, float, float],
+) -> float:
+    return _intersection_area(candidate, other) / max(_area(candidate), 1e-6)
+
+
+def _overlap_strength(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    return _intersection_area(left, right) / max(min(_area(left), _area(right)), 1e-6)
 
 
 def _render_pages(pdf_bytes: bytes, page_numbers: set[int], dpi: int) -> dict[int, Image.Image]:
@@ -109,105 +108,45 @@ def _render_pages(pdf_bytes: bytes, page_numbers: set[int], dpi: int) -> dict[in
     return images
 
 
-def detect_glyph_components(image: Image.Image, page_number: int, dpi: int = RECOVERY_DPI) -> list[GlyphComponent]:
-    """Find small ink components after suppressing long horizontal and vertical rules."""
-    import cv2
-
-    scale = dpi / 72.0
-    gray = cv2.cvtColor(np.asarray(image), cv2.COLOR_RGB2GRAY)
-    binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
-    horizontal = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (max(25, image.width // 25), 1)),
-    )
-    vertical = cv2.morphologyEx(
-        binary,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(cv2.MORPH_RECT, (1, max(25, image.height // 25))),
-    )
-    ink = cv2.subtract(binary, cv2.bitwise_or(horizontal, vertical))
-    count, _, stats, _ = cv2.connectedComponentsWithStats(ink, connectivity=8)
-    components: list[GlyphComponent] = []
-    min_height = max(3, int(scale * 1.2))
-    max_height = max(min_height + 1, int(scale * 24))
-    max_width = max(min_height + 1, int(scale * 28))
-    for label in range(1, count):
-        x, y, width, height, area = (int(value) for value in stats[label])
-        if area < max(4, int(scale)) or height < min_height or height > max_height or width > max_width:
-            continue
-        components.append(
-            GlyphComponent(
-                page_number=page_number,
-                bbox=(x / scale, y / scale, (x + width) / scale, (y + height) / scale),
-                area=area / (scale * scale),
-            )
-        )
-    return components
-
-
-def _rapidocr_recognizer() -> Recognizer:
+def _rapidocr_lenient_detector(dpi: int) -> LenientDetector:
     from rapidocr_onnxruntime import RapidOCR
 
-    # These permissive detector settings are confined to a tiny recovery crop.
-    # The page-wide parser continues to use its unchanged default OCR settings.
-    engine = RapidOCR(det_db_thresh=0.12, det_db_box_thresh=0.20, text_score=0.0)
-
-    def recognize(image: Image.Image) -> tuple[str, float]:
-        result, _ = engine(np.asarray(image), use_det=True, use_cls=False, use_rec=True)
-        if not result or len(result) != 1:
-            return "", 0.0
-        first = result[0] if isinstance(result, list) else result
-        if isinstance(first, (list, tuple)) and len(first) >= 2:
-            if len(first) >= 3 and isinstance(first[1], str):
-                return str(first[1]).strip(), float(first[2])
-            if isinstance(first[0], str):
-                return str(first[0]).strip(), float(first[1])
-        return "", 0.0
-
-    return recognize
-
-
-def _crop(image: Image.Image, bbox: tuple[float, float, float, float], dpi: int) -> Image.Image:
     scale = dpi / 72.0
-    pixel_box = (
-        max(0, floor(bbox[0] * scale)),
-        max(0, floor(bbox[1] * scale)),
-        min(image.width, ceil(bbox[2] * scale)),
-        min(image.height, ceil(bbox[3] * scale)),
-    )
-    return image.crop(pixel_box)
+    engine = RapidOCR(det_db_thresh=0.10, det_db_box_thresh=0.15, text_score=0.0)
+
+    def detect(image: Image.Image, page_number: int) -> list[LenientOCRItem]:
+        result, _ = engine(np.asarray(image), use_det=True, use_cls=True, use_rec=True)
+        items: list[LenientOCRItem] = []
+        for entry in result or []:
+            if not isinstance(entry, (list, tuple)) or len(entry) < 3:
+                continue
+            quad, text, confidence = entry[:3]
+            cleaned = str(text).strip()
+            if not cleaned:
+                continue
+            xs = [float(point[0]) / scale for point in quad]
+            ys = [float(point[1]) / scale for point in quad]
+            items.append(LenientOCRItem(
+                page_number=page_number,
+                text=cleaned,
+                confidence=float(confidence),
+                bbox=(min(xs), min(ys), max(xs), max(ys)),
+            ))
+        return items
+
+    return detect
 
 
-def _recognize_candidate(
-    candidate: RecoveryCandidate,
-    image: Image.Image,
-    recognizer: Recognizer,
-    dpi: int,
-) -> None:
-    crop = _crop(image, candidate.crop_bbox, dpi)
-    gray = crop.convert("L")
-    array = np.asarray(gray)
-    threshold = int(np.median(array))
-    binary = Image.fromarray(np.where(array < threshold, 0, 255).astype(np.uint8), mode="L")
-    variants = []
-    for name, variant in (("grayscale", gray), ("binary", binary)):
-        text, confidence = recognizer(variant)
-        variants.append({"variant": name, "text": text.strip(), "confidence": float(confidence)})
-    candidate.recognition_variants = variants
-    texts = [entry["text"] for entry in variants]
-    confidences = [entry["confidence"] for entry in variants]
-    if texts[0] != texts[1]:
-        candidate.rejection_reason = "recognition_variants_disagree"
-        return
-    if not re.fullmatch(r"[A-Za-z0-9]", texts[0]):
-        candidate.rejection_reason = "not_one_alphanumeric_character"
-        return
-    if min(confidences) < MIN_RECOGNITION_CONFIDENCE:
-        candidate.rejection_reason = "recognition_confidence_below_threshold"
-        return
-    candidate.recognized_text = texts[0]
-    candidate.confidence = min(confidences)
+def _strongest_non_overlapping(items: list[LenientOCRItem]) -> tuple[list[LenientOCRItem], list[LenientOCRItem]]:
+    """Confidence-ranked NMS: retain only the strongest item in each overlap group."""
+    kept: list[LenientOCRItem] = []
+    suppressed: list[LenientOCRItem] = []
+    for item in sorted(items, key=lambda value: (-value.confidence, _area(value.bbox))):
+        if any(_overlap_strength(item.bbox, winner.bbox) >= LENIENT_OVERLAP_THRESHOLD for winner in kept):
+            suppressed.append(item)
+        else:
+            kept.append(item)
+    return kept, suppressed
 
 
 def _row_bands(snapshot: PipelineSnapshot, table_id: str) -> dict[str, tuple[float, float]]:
@@ -227,16 +166,15 @@ def _row_bands(snapshot: PipelineSnapshot, table_id: str) -> dict[str, tuple[flo
 
 def _column_centers(snapshot: PipelineSnapshot, table_id: str) -> dict[str, float]:
     table = snapshot.tables[table_id]
-    centers: dict[str, float] = {}
-    for column_id in table.column_ids:
-        values = [
+    return {
+        column_id: median(values)
+        for column_id in table.column_ids
+        if (values := [
             (cell.bbox[0] + cell.bbox[2]) / 2
             for cell in snapshot.table_cells(table_id)
             if cell.column_id == column_id and cell.bbox
-        ]
-        if values:
-            centers[column_id] = median(values)
-    return centers
+        ])
+    }
 
 
 def _column_lanes(
@@ -254,75 +192,14 @@ def _column_lanes(
     return lanes
 
 
-def _candidate_crop(component: GlyphComponent, row_band: tuple[float, float]) -> tuple[float, float, float, float]:
-    width = component.bbox[2] - component.bbox[0]
-    height = component.bbox[3] - component.bbox[1]
-    padding = max(2.0, width * 0.8, height * 0.35)
-    return (
-        component.bbox[0] - padding,
-        max(row_band[0], component.bbox[1] - padding),
-        component.bbox[2] + padding,
-        min(row_band[1], component.bbox[3] + padding),
-    )
-
-
-def _cluster_components(components: list[tuple[str, GlyphComponent]], tolerance: float) -> list[list[tuple[str, GlyphComponent]]]:
-    clusters: list[list[tuple[str, GlyphComponent]]] = []
-    for entry in sorted(components, key=lambda value: value[1].cx):
+def _cluster_by_x(items: list[tuple[str, LenientOCRItem]], tolerance: float) -> list[list[tuple[str, LenientOCRItem]]]:
+    clusters: list[list[tuple[str, LenientOCRItem]]] = []
+    for entry in sorted(items, key=lambda value: value[1].cx):
         if not clusters or abs(entry[1].cx - median(item[1].cx for item in clusters[-1])) > tolerance:
             clusters.append([entry])
         else:
             clusters[-1].append(entry)
     return clusters
-
-
-def _union_components(page_number: int, components: list[GlyphComponent]) -> GlyphComponent:
-    return GlyphComponent(
-        page_number=page_number,
-        bbox=(
-            min(component.bbox[0] for component in components),
-            min(component.bbox[1] for component in components),
-            max(component.bbox[2] for component in components),
-            max(component.bbox[3] for component in components),
-        ),
-        area=sum(component.area for component in components),
-    )
-
-
-def _merge_glyph_fragments(
-    entries: list[tuple[str, GlyphComponent]],
-    row_bands: dict[str, tuple[float, float]],
-) -> list[tuple[str, GlyphComponent]]:
-    """Merge detached strokes/dots into compact row-local glyph blobs."""
-    merged: list[tuple[str, GlyphComponent]] = []
-    by_row: dict[str, list[GlyphComponent]] = {}
-    for row_id, component in entries:
-        by_row.setdefault(row_id, []).append(component)
-    for row_id, components in by_row.items():
-        row_height = row_bands[row_id][1] - row_bands[row_id][0]
-        groups: list[list[GlyphComponent]] = []
-        for component in sorted(components, key=lambda value: value.bbox[0]):
-            best_group: list[GlyphComponent] | None = None
-            best_distance = float("inf")
-            for group in groups:
-                union = _union_components(component.page_number, group)
-                horizontal_gap = max(0.0, component.bbox[0] - union.bbox[2], union.bbox[0] - component.bbox[2])
-                vertical_gap = max(0.0, component.bbox[1] - union.bbox[3], union.bbox[1] - component.bbox[3])
-                combined_width = max(union.bbox[2], component.bbox[2]) - min(union.bbox[0], component.bbox[0])
-                if (
-                    horizontal_gap <= max(2.5, row_height * 0.18)
-                    and vertical_gap <= max(3.0, row_height * 0.35)
-                    and combined_width <= max(8.0, row_height * 0.9)
-                    and horizontal_gap + vertical_gap < best_distance
-                ):
-                    best_group = group
-                    best_distance = horizontal_gap + vertical_gap
-            if best_group is None:
-                groups.append([component])
-            else:
-                best_group.append(component)
-        merged.extend((row_id, _union_components(group[0].page_number, group)) for group in groups)
-    return merged
 
 
 def recover_missed_glyphs(
@@ -339,8 +216,7 @@ def recover_missed_glyphs_with_result(
     page_results: list[Any],
     source_snapshot: PipelineSnapshot,
     *,
-    recognizer: Recognizer | None = None,
-    component_detector: ComponentDetector | None = None,
+    lenient_detector: LenientDetector | None = None,
     page_images: dict[int, Image.Image] | None = None,
     dpi: int = RECOVERY_DPI,
 ) -> RecoveryResult:
@@ -348,143 +224,80 @@ def recover_missed_glyphs_with_result(
     original_rows = {table_id: list(table.row_ids) for table_id, table in source_snapshot.tables.items()}
     original_columns = {table_id: list(table.column_ids) for table_id, table in source_snapshot.tables.items()}
     original_text = {cell_id: cell.text for cell_id, cell in source_snapshot.cells.items()}
-    recognizer = recognizer or _rapidocr_recognizer()
-    detector = component_detector or (lambda image, page_number: detect_glyph_components(image, page_number, dpi))
     pages = {page.page_number: page for page in page_results}
     images = page_images or _render_pages(pdf_bytes, set(pages), dpi)
-    components_by_page = {page_number: detector(image, page_number) for page_number, image in images.items()}
+    detector = lenient_detector or _rapidocr_lenient_detector(dpi)
     candidates: list[RecoveryCandidate] = []
     recovered_cells = 0
     recovered_columns = 0
 
+    recovered_by_page: dict[int, list[LenientOCRItem]] = {}
+    for page_number, image in images.items():
+        page = pages[page_number]
+        golden_boxes = [(item.x0, item.y0, item.x1, item.y1) for item in page.raw_items if str(item.text).strip()]
+        lenient_items = [
+            item for item in detector(image, page_number)
+            if item.text.strip()
+            and item.confidence >= MIN_RECOVERY_CONFIDENCE
+            and not any(_coverage(item.bbox, golden_box) > GOLDEN_COVERAGE_THRESHOLD for golden_box in golden_boxes)
+        ]
+        recovered_by_page[page_number], _ = _strongest_non_overlapping(lenient_items)
+
     for table_id, table in result.tables.items():
-        page = pages.get(table.page_number)
-        image = images.get(table.page_number)
-        if page is None or image is None:
-            continue
         bands = _row_bands(result, table_id)
         centers = _column_centers(result, table_id)
-        if len(bands) < 2 or not centers:
-            continue
         boxes = [cell.bbox for cell in result.table_cells(table_id) if cell.bbox]
+        if len(bands) < 2 or not centers or not boxes:
+            continue
         table_left = min(box[0] for box in boxes)
         table_right = max(box[2] for box in boxes)
         lanes = _column_lanes(table.column_ids, centers, table_left, table_right)
-        raw_boxes = [(item.x0, item.y0, item.x1, item.y1) for item in page.raw_items]
-        presented_cell_boxes = [
-            cell.bbox
-            for cell in result.table_cells(table_id)
-            if cell.text.strip() and cell.bbox
-        ]
-        presented_boxes = list(dict.fromkeys([*raw_boxes, *presented_cell_boxes]))
-        unmatched: list[tuple[str, GlyphComponent]] = []
-        for component in components_by_page.get(table.page_number, []):
-            row_id = next((row_id for row_id, band in bands.items() if band[0] <= component.cy <= band[1]), None)
-            if not row_id or component.cx < table_left - 30 or component.cx > table_right + 30:
-                continue
-            if _overlaps_presented_item(component, presented_boxes):
-                continue
-            unmatched.append((row_id, component))
+        localized: list[tuple[str, LenientOCRItem]] = []
+        for item in recovered_by_page.get(table.page_number, []):
+            row_id = next((row_id for row_id, band in bands.items() if band[0] <= item.cy <= band[1]), None)
+            if row_id and table_left - 30 <= item.cx <= table_right + 30:
+                localized.append((row_id, item))
 
-        unmatched = _merge_glyph_fragments(unmatched, bands)
         consumed: set[int] = set()
-        empty_cell_candidates: dict[str, list[tuple[int, RecoveryCandidate, GlyphComponent]]] = {}
-        for index, (row_id, component) in enumerate(unmatched):
-            column_id = next((column_id for column_id, lane in lanes.items() if lane[0] <= component.cx <= lane[1]), None)
+        by_empty_cell: dict[str, list[tuple[int, LenientOCRItem]]] = {}
+        for index, (row_id, item) in enumerate(localized):
+            column_id = next((column_id for column_id, lane in lanes.items() if lane[0] <= item.cx <= lane[1]), None)
             target_id = f"{row_id}::{column_id}" if column_id else None
             target = result.cells.get(target_id) if target_id else None
-            if not target or target.text.strip():
-                continue
-            candidate = RecoveryCandidate(
-                candidate_id=f"recovery_candidate_{uuid4().hex[:12]}",
-                page_number=table.page_number,
-                table_id=table_id,
-                row_id=row_id,
-                proposed_x=component.cx,
-                crop_bbox=_candidate_crop(component, bands[row_id]),
-                target_cell_id=target_id,
-                evidence={"kind": "existing_empty_cell", "component_bbox": component.bbox},
-            )
-            _recognize_candidate(candidate, image, recognizer, dpi)
-            candidates.append(candidate)
-            if candidate.recognized_text:
-                empty_cell_candidates.setdefault(target_id, []).append((index, candidate, component))
+            if target and not target.text.strip():
+                by_empty_cell.setdefault(target_id, []).append((index, item))
 
-        for target_id, plausible in empty_cell_candidates.items():
+        for target_id, entries in by_empty_cell.items():
+            winner_index, winner = max(entries, key=lambda entry: entry[1].confidence)
+            candidate = _candidate(winner, table_id, result.cells[target_id].row_id, target_id, "existing_empty_cell")
             target = result.cells[target_id]
-            if len(plausible) != 1:
-                for index, candidate, _ in plausible:
-                    candidate.recognized_text = None
-                    candidate.rejection_reason = "multiple_plausible_glyphs_in_empty_cell"
-                    consumed.add(index)
-                continue
-            index, candidate, component = plausible[0]
-            if not target.text.strip():
-                target.text = candidate.recognized_text
-                target.bbox = component.bbox
-                target.assignment_score = candidate.confidence
-                candidate.accepted = True
-                consumed.add(index)
-                recovered_cells += 1
-                _record_recovery(result, candidate, "recover_empty_cell", [target_id])
+            target.text = winner.text
+            target.bbox = winner.bbox
+            target.assignment_score = winner.confidence
+            candidate.accepted = True
+            consumed.update(index for index, _ in entries)
+            candidates.append(candidate)
+            recovered_cells += 1
+            _record_recovery(result, candidate, "recover_empty_cell", [target_id])
 
-        remaining = [entry for index, entry in enumerate(unmatched) if index not in consumed]
+        remaining = [entry for index, entry in enumerate(localized) if index not in consumed]
         row_heights = [bottom - top for top, bottom in bands.values()]
         tolerance = max(5.0, median(row_heights) * 0.45)
-        for cluster in _cluster_components(remaining, tolerance):
-            distinct_rows = {row_id for row_id, _ in cluster}
+        for cluster in _cluster_by_x(remaining, tolerance):
+            strongest_by_row: dict[str, LenientOCRItem] = {}
+            for row_id, item in cluster:
+                if row_id not in strongest_by_row or item.confidence > strongest_by_row[row_id].confidence:
+                    strongest_by_row[row_id] = item
             row_count = len(bands)
             required = row_count if row_count == 2 else max(3, ceil(row_count * 0.6))
-            cluster_x = median(component.cx for _, component in cluster)
+            cluster_x = median(item.cx for item in strongest_by_row.values())
             distance = min(abs(cluster_x - center) for center in centers.values())
-            if len(distinct_rows) < required or distance <= max(7.0, median(row_heights) * 0.7):
-                for row_id, component in cluster:
-                    candidates.append(RecoveryCandidate(
-                        candidate_id=f"recovery_candidate_{uuid4().hex[:12]}",
-                        page_number=table.page_number,
-                        table_id=table_id,
-                        row_id=row_id,
-                        proposed_x=component.cx,
-                        crop_bbox=component.bbox,
-                        rejection_reason="insufficient_new_column_support",
-                        evidence={"support_rows": sorted(distinct_rows), "required_rows": required},
-                    ))
+            if len(strongest_by_row) < required or distance <= max(7.0, median(row_heights) * 0.7):
                 continue
-            accepted: list[tuple[RecoveryCandidate, GlyphComponent]] = []
-            for row_id, component in cluster:
-                candidate = RecoveryCandidate(
-                    candidate_id=f"recovery_candidate_{uuid4().hex[:12]}",
-                    page_number=table.page_number,
-                    table_id=table_id,
-                    row_id=row_id,
-                    proposed_x=cluster_x,
-                    crop_bbox=_candidate_crop(component, bands[row_id]),
-                    evidence={"kind": "new_column", "support_rows": sorted(distinct_rows), "required_rows": required},
-                )
-                _recognize_candidate(candidate, image, recognizer, dpi)
-                candidates.append(candidate)
-                if candidate.recognized_text:
-                    accepted.append((candidate, component))
-            accepted_by_row: dict[str, tuple[RecoveryCandidate, GlyphComponent]] = {}
-            for entry in accepted:
-                candidate = entry[0]
-                previous = accepted_by_row.get(candidate.row_id)
-                if previous is None or candidate.confidence > previous[0].confidence:
-                    if previous is not None:
-                        previous[0].recognized_text = None
-                        previous[0].rejection_reason = "duplicate_component_in_row"
-                    accepted_by_row[candidate.row_id] = entry
-                else:
-                    candidate.recognized_text = None
-                    candidate.rejection_reason = "duplicate_component_in_row"
-            accepted = list(accepted_by_row.values())
-            accepted_rows = {candidate.row_id for candidate, _ in accepted}
-            if len(accepted_rows) < required:
-                for candidate, _ in accepted:
-                    candidate.recognized_text = None
-                    candidate.accepted = False
-                    candidate.rejection_reason = "insufficient_recognized_column_support"
-                continue
+            accepted = [
+                (_candidate(item, table_id, row_id, None, "new_column"), item)
+                for row_id, item in strongest_by_row.items()
+            ]
             new_column_id = _insert_recovered_column(result, table_id, cluster_x, accepted)
             recovered_columns += 1
             recovered_cells += len(accepted)
@@ -492,18 +305,20 @@ def recover_missed_glyphs_with_result(
                 candidate.proposed_column_id = new_column_id
                 candidate.target_cell_id = f"{candidate.row_id}::{new_column_id}"
                 candidate.accepted = True
+                candidates.append(candidate)
             _record_recovery(
                 result,
                 accepted[0][0],
                 "insert_recovered_column",
                 [new_column_id, *[candidate.target_cell_id for candidate, _ in accepted]],
-                extra={"support_rows": sorted(accepted_rows), "recovered_values": len(accepted_rows)},
+                extra={"support_rows": sorted(strongest_by_row), "recovered_values": len(accepted)},
             )
 
     for table_id, row_ids in original_rows.items():
         if result.tables[table_id].row_ids != row_ids:
             raise ValueError("OCR recovery changed existing row order.")
-        if [column_id for column_id in result.tables[table_id].column_ids if column_id in original_columns[table_id]] != original_columns[table_id]:
+        existing_order = [column_id for column_id in result.tables[table_id].column_ids if column_id in original_columns[table_id]]
+        if existing_order != original_columns[table_id]:
             raise ValueError("OCR recovery changed existing column order.")
     for cell_id, text in original_text.items():
         if text.strip() and result.cells[cell_id].text != text:
@@ -520,11 +335,31 @@ def recover_missed_glyphs_with_result(
     )
 
 
+def _candidate(
+    item: LenientOCRItem,
+    table_id: str,
+    row_id: str,
+    target_cell_id: str | None,
+    kind: str,
+) -> RecoveryCandidate:
+    return RecoveryCandidate(
+        candidate_id=f"recovery_candidate_{uuid4().hex[:12]}",
+        page_number=item.page_number,
+        table_id=table_id,
+        row_id=row_id,
+        text=item.text,
+        confidence=item.confidence,
+        bbox=item.bbox,
+        target_cell_id=target_cell_id,
+        evidence={"kind": kind},
+    )
+
+
 def _insert_recovered_column(
     snapshot: PipelineSnapshot,
     table_id: str,
     x_position: float,
-    accepted: list[tuple[RecoveryCandidate, GlyphComponent]],
+    accepted: list[tuple[RecoveryCandidate, LenientOCRItem]],
 ) -> str:
     table = snapshot.tables[table_id]
     centers = _column_centers(snapshot, table_id)
@@ -537,17 +372,17 @@ def _insert_recovered_column(
         placeholder_index += 1
     table.column_names[new_column_id] = f"col_{placeholder_index}"
     snapshot.column_lineage[new_column_id] = [new_column_id]
-    values = {candidate.row_id: (candidate, component) for candidate, component in accepted}
+    values = {candidate.row_id: (candidate, item) for candidate, item in accepted}
     for row_id in table.row_ids:
-        candidate_component = values.get(row_id)
-        candidate, component = candidate_component if candidate_component else (None, None)
+        candidate_item = values.get(row_id)
+        candidate, item = candidate_item if candidate_item else (None, None)
         cell_id = f"{row_id}::{new_column_id}"
         snapshot.cells[cell_id] = CellState(
             cell_id=cell_id,
             row_id=row_id,
             column_id=new_column_id,
-            text=candidate.recognized_text if candidate else "",
-            bbox=component.bbox if component else None,
+            text=candidate.text if candidate else "",
+            bbox=item.bbox if item else None,
             assignment_score=candidate.confidence if candidate else 1.0,
             ancestor_cell_ids=[cell_id],
         )
@@ -566,23 +401,23 @@ def _record_recovery(
     snapshot.issues[issue_id] = IssueState(
         issue_id=issue_id,
         source_issue_id=issue_id,
-        issue_type="recovered_missed_glyph" if action == "recover_empty_cell" else "recovered_missing_column",
+        issue_type="recovered_ocr_item" if action == "recover_empty_cell" else "recovered_missing_column",
         severity="info",
         table_id=candidate.table_id,
         affected_cell_ids=[value for value in affected_ids if "::" in value],
         status="resolved",
-        explanation="A missed single-character OCR value was recovered from a targeted page-image crop.",
+        explanation="A text item found only by the lenient OCR pass was added without changing golden OCR text.",
         suggested_action="No action required.",
         evidence={"candidate_id": candidate.candidate_id, **(extra or {})},
     )
     snapshot.decisions.append(DecisionRecord(
         decision_id=f"decision_{uuid4().hex[:12]}",
         phase="ocr_recovery",
-        target_id=candidate.target_cell_id or candidate.table_id,
+        target_id=candidate.target_cell_id or str(candidate.table_id),
         action=action,
         confidence=candidate.confidence,
-        reason="Two targeted recognition variants agreed on one alphanumeric character.",
-        payload={"candidate_id": candidate.candidate_id, "text": candidate.recognized_text, **(extra or {})},
+        reason="Strongest non-overlapping text item from the lenient OCR pass.",
+        payload={"candidate_id": candidate.candidate_id, "text": candidate.text, **(extra or {})},
         valid=True,
         applied=True,
         affected_ids=affected_ids,
