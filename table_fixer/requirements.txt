@@ -1,4 +1,7 @@
 streamlit
+fastapi
+uvicorn
+python-multipart
 PyMuPDF
 rapidocr-onnxruntime
 Pillow

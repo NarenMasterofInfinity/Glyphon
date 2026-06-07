@@ -1,0 +1,302 @@
+openapi: 3.1.0
+info:
+  title: Glyphon Table Fixer API
+  version: unversioned
+  description: FastAPI service for running the Glyphon table_fixer workflow phase-by-phase or as contiguous auto-apply runs.
+servers:
+  - url: http://localhost:8770
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: health
+      responses:
+        '200':
+          description: Service health
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                  service:
+                    type: string
+                  port:
+                    type: integer
+                required: [status, service, port]
+  /openapi.yaml:
+    get:
+      summary: Download OpenAPI YAML
+      operationId: openapiYaml
+      responses:
+        '200':
+          description: OpenAPI yaml document
+          content:
+            application/yaml:
+              schema:
+                type: string
+  /table-fixer/workspaces:
+    post:
+      summary: Create workspace and optionally run phases
+      operationId: createWorkspace
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+                page_numbers:
+                  type: string
+                  description: JSON array string or comma-separated list, for example `[1,2]` or `1,2`.
+                phases:
+                  type: string
+                  description: Optional JSON array string or comma-separated phase list.
+                execution_mode:
+                  $ref: '#/components/schemas/ExecutionMode'
+                model:
+                  type: string
+                  default: gemma3:4b
+                base_url:
+                  type: string
+                  default: http://localhost:11434
+                context_token_budget:
+                  type: integer
+                  minimum: 500
+                  maximum: 16000
+                  default: 3500
+                auto_apply_threshold:
+                  type: number
+                  minimum: 0.5
+                  maximum: 1.0
+                  default: 0.8
+                structural_auto_apply_threshold:
+                  type: number
+                  minimum: 0.8
+                  maximum: 1.0
+                  default: 0.95
+              required: [file]
+      responses:
+        '200':
+          description: Workspace created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '502':
+          $ref: '#/components/responses/ErrorResponse'
+  /table-fixer/workspaces/{workspace_id}:
+    get:
+      summary: Get workspace state
+      operationId: getWorkspace
+      parameters:
+        - in: path
+          name: workspace_id
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Workspace status and latest accepted result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+  /table-fixer/workspaces/{workspace_id}/execute:
+    post:
+      summary: Execute contiguous phases from accepted workspace state
+      operationId: executeWorkspacePhases
+      parameters:
+        - in: path
+          name: workspace_id
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutePhasesRequest'
+      responses:
+        '200':
+          description: Execution completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '502':
+          $ref: '#/components/responses/ErrorResponse'
+  /table-fixer/workspaces/{workspace_id}/reviews/{phase}:
+    post:
+      summary: Accept or reject a pending preview
+      operationId: reviewPhase
+      parameters:
+        - in: path
+          name: workspace_id
+          required: true
+          schema:
+            type: string
+        - in: path
+          name: phase
+          required: true
+          schema:
+            $ref: '#/components/schemas/Phase'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReviewDecisionRequest'
+      responses:
+        '200':
+          description: Review applied
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WorkspaceResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+components:
+  responses:
+    ErrorResponse:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail:
+                oneOf:
+                  - type: string
+                  - type: array
+                    items:
+                      type: object
+          examples:
+            default:
+              value:
+                detail: Request could not be completed.
+  schemas:
+    Phase:
+      type: string
+      enum: [reconciliation, metadata, headers, columns, warnings]
+    ExecutionMode:
+      type: string
+      enum: [preview, auto_apply]
+    ExecutePhasesRequest:
+      type: object
+      properties:
+        phases:
+          type: array
+          items:
+            $ref: '#/components/schemas/Phase'
+          minItems: 1
+        execution_mode:
+          $ref: '#/components/schemas/ExecutionMode'
+        model:
+          type: string
+          default: gemma3:4b
+        base_url:
+          type: string
+          default: http://localhost:11434
+        context_token_budget:
+          type: integer
+          minimum: 500
+          maximum: 16000
+          default: 3500
+        auto_apply_threshold:
+          type: number
+          minimum: 0.5
+          maximum: 1.0
+          default: 0.8
+        structural_auto_apply_threshold:
+          type: number
+          minimum: 0.8
+          maximum: 1.0
+          default: 0.95
+      required: [phases]
+    ReviewDecisionRequest:
+      type: object
+      properties:
+        decision:
+          type: string
+          enum: [accept, reject]
+      required: [decision]
+    WorkspaceStatus:
+      type: object
+      properties:
+        workspace_id:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        source_file:
+          type: string
+        file_key:
+          type: string
+        page_numbers:
+          type: array
+          items:
+            type: integer
+        accepted_phases:
+          type: array
+          items:
+            $ref: '#/components/schemas/Phase'
+        latest_accepted_phase:
+          type: string
+        next_available_phases:
+          type: array
+          items:
+            $ref: '#/components/schemas/Phase'
+        pending_review_phase:
+          anyOf:
+            - $ref: '#/components/schemas/Phase'
+            - type: 'null'
+      required:
+        - workspace_id
+        - created_at
+        - source_file
+        - file_key
+        - page_numbers
+        - accepted_phases
+        - latest_accepted_phase
+        - next_available_phases
+        - pending_review_phase
+    WorkspaceResponse:
+      type: object
+      properties:
+        workspace_id:
+          type: string
+        status:
+          $ref: '#/components/schemas/WorkspaceStatus'
+        result:
+          type: object
+          description: Latest accepted result, including tables, cells, bounding boxes, warnings, and issues.
+          additionalProperties: true
+        pending_review:
+          anyOf:
+            - type: object
+              additionalProperties: true
+            - type: 'null'
+        phase_runs:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+      required: [workspace_id, status, result, phase_runs]
