@@ -382,9 +382,14 @@ def column_split_context(snapshot: PipelineSnapshot, issue_id: str, sample_limit
             break
     return {
         "task": (
-            "Decide whether this single column consistently contains multiple fields. "
-            "If it does, return a Python full-match regex with 2-4 named groups. "
-            "The group names should be short field names and every sample must match."
+            "Decide from the current header alone whether it accidentally combines multiple column headers. "
+            "Split only when the current header itself clearly contains 2-4 distinct field names. Common multiword "
+            "field names such as Tenant Name, Customer Name, Item Name, and Unit Price are one field and must not be "
+            "split. A visibly concatenated header such as InvoiceDate may indicate merged Invoice and Date headers. "
+            "Sample values may only confirm a header-based split and help build its regex; they must never "
+            "independently justify splitting a normal header. If the header is not clearly merged, choose no_split. "
+            "For split, new_headers must be the exact header parts in their original order and the Python full-match "
+            "regex must match every sample."
         ),
         "current_header": table.column_names.get(column_id, column_id),
         "nearby_headers": [
@@ -393,7 +398,7 @@ def column_split_context(snapshot: PipelineSnapshot, issue_id: str, sample_limit
             if abs(table.column_ids.index(column) - table.column_ids.index(column_id)) <= 1
         ],
         "why_flagged": issue.explanation,
-        "sample_values": [cell.text for cell in distinct],
+        "sample_values_for_regex_validation_only": [cell.text for cell in distinct],
         "_table_id": table.table_id,
         "_column_id": column_id,
     }
@@ -454,7 +459,7 @@ def placeholder_column_context(
         "placeholder_header": table.column_names.get(column_id, column_id),
         "sample_values": source_values[:sample_limit],
         "candidate_named_columns": candidates[:6],
-        "examples_only_do_not_copy": [
+        "decision_examples": [
             {
                 "placeholder_values": ["Alice Engineering", "Bob Finance"],
                 "empty_candidate_headers": ["Employee", "Department"],
@@ -610,36 +615,52 @@ def row_repair_context(
             )
         ]
 
-    columns = []
-    row_index = table.row_ids.index(row_id)
+    repair_columns = []
     for column_id in repair_column_ids:
         header = table.column_names.get(column_id, column_id)
         cell_id = f"{row_id}::{column_id}"
-        columns.append({
+        repair_columns.append({
             "header": header,
-            "current_text": snapshot.cells[cell_id].text if cell_id in snapshot.cells else "",
-            "examples_only_do_not_copy": [
-                snapshot.cells[example_id].text
-                for nearby_row_id in table.row_ids[max(0, row_index - 2):row_index + 3]
-                if nearby_row_id != row_id
-                and (example_id := f"{nearby_row_id}::{column_id}") in snapshot.cells
-                and snapshot.cells[example_id].text.strip()
-            ][:3],
+            "entry": snapshot.cells[cell_id].text if cell_id in snapshot.cells else "",
         })
     return {
         "task": (
-            "Repair only the listed columns in this one row. Arrange the available_parts under the correct headers. "
-            "You may combine adjacent parts into one value. Nearby examples show column meaning only and must never "
-            "be copied. Return final_values for every non-empty final value. Use every available part exactly once. "
-            "Do not calculate or invent values."
+            "The identified cells contain merged or displaced table entries. Use the full row to understand where "
+            "those entries belong. Correct only the listed repair columns. Return final_values for every non-empty "
+            "final entry in the repair columns. Keep unaffected full-row entries unchanged. Split or move existing "
+            "text as needed, but do not calculate, invent, duplicate, or omit text. Set needs_correction to true "
+            "whenever final_values changes any repair-column entry. Set it to false only when final_values is empty "
+            "and the repair columns should remain exactly unchanged."
         ),
-        "problem": " ".join(dict.fromkeys(issue.explanation for issue in issues)),
-        "available_parts": [
-            part
-            for column in columns
-            for part in column["current_text"].split()
+        "full_row": [
+            {
+                "header": table.column_names.get(column_id, column_id),
+                "entry": snapshot.cells[cell_id].text if cell_id in snapshot.cells else "",
+            }
+            for column_id in table.column_ids
+            if (cell_id := f"{row_id}::{column_id}") in snapshot.cells
         ],
-        "columns": columns,
+        "identified_problems": [
+            {
+                "type": issue.issue_type,
+                "affected_headers": [
+                    table.column_names.get(snapshot.cells[cell_id].column_id, snapshot.cells[cell_id].column_id)
+                    for cell_id in issue.affected_cell_ids
+                    if cell_id in snapshot.cells and snapshot.cells[cell_id].row_id == row_id
+                ],
+                "expected_headers": list(dict.fromkeys([
+                    value
+                    for value in [
+                        issue.evidence.get("expected_header"),
+                        *issue.evidence.get("expected_headers", []),
+                    ]
+                    if isinstance(value, str)
+                ])),
+                "description": issue.explanation,
+            }
+            for issue in issues
+        ],
+        "repair_columns": repair_columns,
         "_row_id": row_id,
         "_issue_ids": [issue.issue_id for issue in issues],
         "_column_ids_by_header": {

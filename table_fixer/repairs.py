@@ -305,6 +305,29 @@ def _rebase_issues_to_data_rows(snapshot: PipelineSnapshot) -> None:
 UNSAFE_REGEX_PARTS = ("(?=", "(?!", "(?<=", "(?<!", "\\1", "\\2", "\\3", "(?P=")
 
 
+def header_parts(value: str) -> list[str]:
+    return [
+        part.lower()
+        for part in re.findall(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|\d+", value)
+    ]
+
+
+def validate_header_split(source_header: str, new_headers: list[str]) -> list[str]:
+    source_parts = header_parts(source_header)
+    proposed_parts = [header_parts(header) for header in new_headers]
+    if not 2 <= len(new_headers) <= 4:
+        return ["Header-based split requires 2-4 new headers."]
+    if any(not parts for parts in proposed_parts):
+        return ["Every proposed header must contain meaningful header text."]
+    flattened = [part for parts in proposed_parts for part in parts]
+    if flattened != source_parts:
+        return [
+            "Column split rejected: proposed headers must exactly reconstruct the current header in order. "
+            "Values cannot justify new fields that are absent from the header."
+        ]
+    return []
+
+
 def validate_split_regex(
     source_header: str,
     pattern: str,
@@ -344,6 +367,8 @@ def validate_split_regex(
 def infer_whitespace_split(
     source_header: str,
     values: list[str],
+    *,
+    require_header_parts: bool = False,
 ) -> tuple[str, list[str]] | None:
     parts = [value.split() for value in values]
     counts = {len(value_parts) for value_parts in parts}
@@ -352,15 +377,17 @@ def infer_whitespace_split(
     count = next(iter(counts), 0)
     if not 2 <= count <= 4:
         return None
-    header_parts = re.findall(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|\d+", source_header)
-    if len(header_parts) != count:
-        header_parts = [f"Field {index}" for index in range(1, count + 1)]
+    inferred_headers = re.findall(r"[A-Z]+(?=[A-Z][a-z]|\b)|[A-Z]?[a-z]+|\d+", source_header)
+    if len(inferred_headers) != count:
+        if require_header_parts:
+            return None
+        inferred_headers = [f"Field {index}" for index in range(1, count + 1)]
     group_names = [
         re.sub(r"[^a-z0-9]+", "_", header.lower()).strip("_") or f"field_{index}"
-        for index, header in enumerate(header_parts, start=1)
+        for index, header in enumerate(inferred_headers, start=1)
     ]
     pattern = r"\s+".join(f"(?P<{name}>\\S+)" for name in group_names)
-    return pattern, header_parts
+    return pattern, inferred_headers
 
 
 def apply_column_split(

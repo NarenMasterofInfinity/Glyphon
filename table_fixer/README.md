@@ -23,14 +23,17 @@ Structural auto-apply defaults to a conservative `0.95` confidence threshold. Ce
 warning repairs are applied only after binary LLM decisions pass deterministic validation; occupied-target
 moves are rejected, and invalid metadata/header decisions cannot consume or partially mutate a table.
 
-Cell-level diagnostics are grouped into one small row-local repair task. Each prompt contains only the
-problem description, relevant headers, current text split into `available_parts`, and nearby examples that
-are explicitly context-only. The LLM returns a `final_values` header-to-text map. Code applies it atomically
-only when every original token is preserved exactly once and no new value was invented.
+Actionable cell-level diagnostics are grouped into one small row-local repair task. OCR-confidence diagnostics
+never reach the LLM and remain available as parser diagnostics. Each repair prompt shows the complete row as
+simple header-entry pairs, identifies the affected cells and merge/displacement problems, and lists the columns
+that may change. The LLM returns a `final_values` header-to-text map. Code applies it atomically only when every
+original repair-zone token is preserved exactly once and no new value was invented.
 
-Merged-column prompts handle one column at a time. If the LLM identifies a split but repeatedly produces
-an invalid regex, code can apply a conservative whitespace split only when every column value has the same
-2-4 part structure.
+Merged-column prompts handle one column at a time and decide eligibility from the header alone. Values may
+only help construct and validate a regex after the header clearly supports a split. Code rejects proposed
+fields that do not exactly reconstruct the current header, preventing repeated value patterns from splitting
+normal headers such as `Tenant Name`. A conservative whitespace fallback is allowed only for an already
+header-approved split.
 
 Phase 4 also treats every remaining `col_N` header as a structural defect. One focused prompt decides whether
 the whole placeholder column should move into one named column, split into 2-3 named columns, or be renamed as

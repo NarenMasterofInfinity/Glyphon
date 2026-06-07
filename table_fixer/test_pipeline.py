@@ -16,7 +16,7 @@ from table_fixer.models import (
     RowState,
 )
 from table_fixer.ollama_client import OllamaClientError, OllamaLLMClient, StructuredResponse
-from table_fixer.pipeline import SYSTEM_PROMPTS, TableFixerPipeline, normalize_header_groups
+from table_fixer.pipeline import SYSTEM_PROMPTS, TableFixerPipeline, is_ocr_confidence_issue, normalize_header_groups
 from table_fixer.repairs import apply_headers, decision
 from table_fixer.token_counting import TokenCounter
 from table_fixer.workspace import persist_llm_trace, persist_snapshot
@@ -55,9 +55,9 @@ class HeaderAwareMockClient(MockClient):
         super().__init__([])
 
     def structured(self, **kwargs):
-        columns = kwargs["context"]["columns"]
-        expected_header = kwargs["context"]["problem"].removeprefix("Expected header: ")
-        source = next(column for column in columns if column["current_text"])
+        columns = kwargs["context"]["repair_columns"]
+        expected_header = kwargs["context"]["identified_problems"][0]["description"].removeprefix("Expected header: ")
+        source = next(column for column in columns if column["entry"])
         if source["header"] == expected_header:
             response = {
                 "needs_correction": False,
@@ -70,7 +70,7 @@ class HeaderAwareMockClient(MockClient):
                 "needs_correction": True,
                 "confidence": 0.99,
                 "reason": f"Value belongs under {expected_header}.",
-                "assignments": [{"target_header": expected_header, "text": source["current_text"]}],
+                "assignments": [{"target_header": expected_header, "text": source["entry"]}],
             }
         self.responses.append(response)
         return super().structured(**kwargs)
@@ -442,6 +442,63 @@ class PipelineTests(unittest.TestCase):
         self.assertTrue(result.decisions[0].valid)
         self.assertEqual(len(result.proposed_snapshot.tables["p1_t1"].column_ids), 2)
 
+    def test_column_split_rejects_fields_not_present_in_normal_multiword_header(self):
+        snapshot = make_snapshot(
+            [["Sithambar Jegadheesh"], ["Kumar Priya"]],
+            column_names=("Tenant Name",),
+        )
+        affected = ["p1_t1_r1::p1_t1_c1", "p1_t1_r2::p1_t1_c1"]
+        snapshot.issues["merged"] = IssueState(
+            "merged", "merged", "possible_merged_column", "warning", "p1_t1",
+            affected, "active", "Names contain repeated parts", "split",
+        )
+        client = MockClient([{
+            "action": "split",
+            "confidence": 0.99,
+            "reason": "Values look like last and first names.",
+            "regex": r"(?P<last>\S+)\s+(?P<first>\S+)",
+            "new_headers": ["Last Name", "First Name"],
+            "expected": {},
+        }])
+
+        result = TableFixerPipeline(client).run_columns(snapshot, auto_apply=True)
+
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(result.decisions[0].valid)
+        self.assertFalse(result.decisions[0].applied)
+        self.assertIn(
+            "Values cannot justify new fields that are absent from the header.",
+            result.decisions[0].validation_errors[0],
+        )
+        self.assertEqual(
+            result.proposed_snapshot.tables["p1_t1"].column_names["p1_t1_c1"],
+            "Tenant Name",
+        )
+        self.assertEqual(result.proposed_snapshot.cells["p1_t1_r1::p1_t1_c1"].text, "Sithambar Jegadheesh")
+
+    def test_column_split_context_marks_values_as_regex_validation_only(self):
+        snapshot = make_snapshot([["Bob 20"], ["Sue 30"]], column_names=("Name Age",))
+        affected = ["p1_t1_r1::p1_t1_c1", "p1_t1_r2::p1_t1_c1"]
+        snapshot.issues["merged"] = IssueState(
+            "merged", "merged", "possible_merged_column", "warning", "p1_t1",
+            affected, "active", "merged", "split",
+        )
+        client = MockClient([{
+            "action": "no_split",
+            "confidence": 0.99,
+            "reason": "Header is one field.",
+            "regex": "",
+            "new_headers": ["Unused", "Values"],
+            "expected": {},
+        }])
+
+        TableFixerPipeline(client).run_columns(snapshot)
+
+        context = client.calls[0]["context"]
+        self.assertIn("sample_values_for_regex_validation_only", context)
+        self.assertNotIn("sample_values", context)
+        self.assertIn("current header alone", context["task"])
+
     def test_placeholder_column_moves_into_empty_named_column(self):
         snapshot = make_snapshot(
             [["4", "", "5"], ["5", "", "2"]],
@@ -555,7 +612,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(table.column_names["p1_t1_c1"], "Item Code")
         self.assertEqual(result.proposed_snapshot.cells["p1_t1_r1::p1_t1_c1"].text, "P1001")
 
-    def test_warning_phase_groups_and_resolves_cell_info_with_warning(self):
+    def test_warning_phase_excludes_ocr_confidence_from_actionable_warning(self):
         snapshot = make_snapshot([["Bob", "20"]])
         warning_cell = "p1_t1_r1::p1_t1_c1"
         snapshot.issues["warn"] = IssueState(
@@ -581,8 +638,29 @@ class PipelineTests(unittest.TestCase):
 
         self.assertEqual(len(client.calls), 1)
         self.assertEqual(result.proposed_snapshot.issues["warn"].status, "dismissed")
-        self.assertEqual(result.proposed_snapshot.issues["info"].status, "dismissed")
+        self.assertEqual(result.proposed_snapshot.issues["info"].status, "active")
         self.assertNotIn("issue_ids", client.calls[0]["context"])
+        self.assertNotIn("low_ocr_confidence", json.dumps(client.calls[0]["context"]))
+
+    def test_ocr_confidence_issue_never_reaches_llm(self):
+        snapshot = make_snapshot([["Unreadable", "20"]])
+        warning_cell = "p1_t1_r1::p1_t1_c1"
+        snapshot.issues["ocr"] = IssueState(
+            "ocr", "ocr", "low_ocr_confidence", "warning", "p1_t1",
+            [warning_cell], "active", "OCR confidence is low.", "review",
+        )
+        client = MockClient([])
+
+        result = TableFixerPipeline(client).run_warnings(snapshot, auto_apply=True)
+
+        self.assertEqual(client.calls, [])
+        self.assertEqual(result.decisions, [])
+        self.assertEqual(result.proposed_snapshot.issues["ocr"].status, "active")
+        self.assertTrue(is_ocr_confidence_issue(snapshot.issues["ocr"]))
+        self.assertTrue(is_ocr_confidence_issue(IssueState(
+            "generic", "generic", "diagnostic", "info", "p1_t1",
+            [warning_cell], "active", "OCR confidence is low.", "review",
+        )))
 
     def test_warning_correction_rejects_invalid_occupied_target_move(self):
         snapshot = make_snapshot([["Bob", "20"]])
@@ -636,7 +714,13 @@ class PipelineTests(unittest.TestCase):
         TableFixerPipeline(client).run_warnings(snapshot)
 
         context = client.calls[0]["context"]
-        self.assertEqual([column["header"] for column in context["columns"]], ["Name", "Age"])
+        self.assertEqual([column["header"] for column in context["repair_columns"]], ["Name", "Age"])
+        self.assertEqual(
+            context["full_row"],
+            [{"header": "Name", "entry": "Bob"}, {"header": "Age", "entry": "20"}],
+        )
+        self.assertNotIn("available_parts", context)
+        self.assertNotIn("examples_only_do_not_copy", json.dumps(context))
         self.assertNotIn("cell_id", json.dumps(context))
 
     def test_warning_binary_correction_applies_valid_code_action(self):
@@ -664,6 +748,42 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.proposed_snapshot.cells[source_cell].text, "")
         self.assertEqual(result.proposed_snapshot.cells[target_cell].text, "Bob")
         self.assertEqual(result.proposed_snapshot.issues["warn"].status, "resolved")
+
+    def test_warning_retries_contradictory_no_correction_with_changed_values(self):
+        snapshot = make_snapshot(
+            [["", "Sithambar, Jegadheesh 20/12/2004"]],
+            column_names=("Tenant Name", "Date"),
+        )
+        source_cell = "p1_t1_r1::p1_t1_c2"
+        snapshot.issues["warn"] = IssueState(
+            "warn", "warn", "item_crosses_boundary", "warning", "p1_t1",
+            [source_cell], "active", "Tenant name is merged into Date.", "repair",
+            evidence={"expected_headers": ["Tenant Name", "Date"]},
+        )
+        corrected = {
+            "needs_correction": True,
+            "confidence": 0.99,
+            "reason": "Split tenant name from date.",
+            "final_values": {
+                "Tenant Name": "Sithambar, Jegadheesh",
+                "Date": "20/12/2004",
+            },
+        }
+        client = MockClient([
+            {
+                **corrected,
+                "needs_correction": False,
+            },
+            corrected,
+        ])
+
+        result = TableFixerPipeline(client).run_warnings(snapshot, auto_apply=True)
+
+        self.assertEqual(len(client.calls), 2)
+        self.assertIn("consistent binary decision", client.calls[1]["context"]["retry_instruction"])
+        self.assertTrue(result.decisions[0].applied)
+        self.assertEqual(result.proposed_snapshot.cells["p1_t1_r1::p1_t1_c1"].text, "Sithambar, Jegadheesh")
+        self.assertEqual(result.proposed_snapshot.cells[source_cell].text, "20/12/2004")
 
     def test_mock_warning_data_uses_headers_for_binary_decisions_and_code_repairs(self):
         fixture_path = Path(__file__).parent / "mock_data" / "warning_header_context.json"
@@ -759,7 +879,7 @@ class PipelineTests(unittest.TestCase):
         ))
         context = client.calls[0]["context"]
         self.assertEqual(
-            [column["header"] for column in context["columns"]],
+            [column["header"] for column in context["repair_columns"]],
             ["Policy functions", "Financial"],
         )
 
@@ -796,7 +916,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result.proposed_snapshot.cells[source_id].text, "")
         self.assertEqual(result.proposed_snapshot.cells[name_id].text, "Alice")
         self.assertEqual(result.proposed_snapshot.cells[department_id].text, "Engineering")
-        self.assertEqual(client.calls[0]["context"]["columns"][0]["header"], "col_1")
+        self.assertEqual(client.calls[0]["context"]["repair_columns"][0]["header"], "col_1")
 
     def test_redistribute_cell_rejects_token_loss_and_occupied_target_atomically(self):
         snapshot = make_snapshot(
@@ -890,7 +1010,7 @@ class PipelineTests(unittest.TestCase):
         TableFixerPipeline(client, context_token_budget=80).run_warnings(snapshot)
 
         self.assertEqual(len(client.calls), 8)
-        self.assertTrue(all("columns" in call["context"] for call in client.calls))
+        self.assertTrue(all("full_row" in call["context"] for call in client.calls))
 
 
 if __name__ == "__main__":

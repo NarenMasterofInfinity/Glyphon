@@ -40,6 +40,7 @@ from .repairs import (
     apply_warning_decisions,
     decision,
     infer_whitespace_split,
+    validate_header_split,
     validate_split_regex,
     validate_placeholder_column_action,
     validate_warning_action,
@@ -75,11 +76,12 @@ SYSTEM_PROMPTS = {
         "Predecessor tail rows are context only and may reveal a preceding header fragment."
     ),
     "columns": (
-        "Work on the one supplied column only. Decide whether every sample contains the same multiple fields. "
-        "Repeated whitespace-separated parts with different stable formats are separate fields, even when the "
-        "current header combines their names. "
-        "If yes, return a Python full-match regex with 2-4 named groups and clear field headers. "
-        "If no, choose no_split."
+        "Work on the one supplied column only. Decide whether to split from the current header alone. Split only "
+        "when that header clearly combines multiple distinct field names. A normal multiword header is one field "
+        "and must remain unchanged, even when its values contain repeated parts. A visibly concatenated header such "
+        "as InvoiceDate may be split into Invoice and Date when the header itself supports that interpretation. "
+        "Sample values are only for regex construction and validation after the header has justified a split. For "
+        "split, new_headers must be the exact ordered parts of the current header. Otherwise choose no_split."
     ),
     "placeholder_column": (
         "Resolve one unnamed placeholder column using one lossless whole-column rule. A move is valid only when "
@@ -89,10 +91,11 @@ SYSTEM_PROMPTS = {
         "values form a genuine distinct field. Choose unresolved when none is reliable."
     ),
     "warnings": (
-        "Repair the one supplied row problem. Consider only the listed columns. Arrange available_parts under the "
-        "correct headers. Nearby examples are context only and must not appear in output unless already present in "
-        "available_parts. Return final_values mapping headers to final non-empty text. Use every available part "
-        "exactly once. Do not calculate, invent, or request manual review."
+        "Repair merged or displaced entries in the one supplied row. Use the full row to understand each entry's "
+        "meaning, but change only the listed repair columns. Return final_values mapping repair headers to their "
+        "final non-empty entries. Set needs_correction=true whenever final_values changes an entry. Set "
+        "needs_correction=false only when final_values is empty and no repair is needed. Reuse all text from the "
+        "repair columns exactly once. Do not calculate, invent, duplicate, omit text, or request manual review."
     ),
     "regex_repair": (
         "Repair only the supplied Python regex so actual output exactly matches expected output. "
@@ -104,6 +107,11 @@ SYSTEM_PROMPTS = {
     phase: f"{prompt} {STRUCTURED_RESPONSE_INSTRUCTION}"
     for phase, prompt in SYSTEM_PROMPTS.items()
 }
+
+
+def is_ocr_confidence_issue(issue: IssueState) -> bool:
+    text = f"{issue.issue_type} {issue.explanation}".lower().replace("-", "_").replace(" ", "_")
+    return "ocr" in text and "confidence" in text
 
 
 def normalize_header_groups(row_ids: list[str], groups: list[list[str]]) -> list[list[str]]:
@@ -506,7 +514,7 @@ class TableFixerPipeline:
                     column_split_context(current, issue_id),
                     self.client.token_counter,
                     self.context_token_budget,
-                    "samples",
+                    "sample_values_for_regex_validation_only",
                 )
             except ValueError as exc:
                 record = decision(
@@ -547,24 +555,29 @@ class TableFixerPipeline:
                     "column_id": private_column_id,
                 }
             if action == "split":
+                header_errors = validate_header_split(context["current_header"], payload["new_headers"])
+                errors.extend(header_errors)
                 table = current.tables[private_table_id]
                 values = [
                     cell.text for row_id in table.row_ids
                     if (cell := current.cells.get(f"{row_id}::{private_column_id}")) and cell.text.strip()
                 ]
-                compiled, validation_errors, actual = validate_split_regex(
-                    context["current_header"],
-                    payload["regex"],
-                    payload["new_headers"],
-                    values,
-                    payload["expected"],
-                )
-                errors.extend(validation_errors)
+                regex_errors: list[str] = []
+                if not header_errors:
+                    compiled, regex_errors, actual = validate_split_regex(
+                        context["current_header"],
+                        payload["regex"],
+                        payload["new_headers"],
+                        values,
+                        payload["expected"],
+                    )
+                    errors.extend(regex_errors)
                 repair_count = 0
-                while errors and repair_count < 2:
+                while not header_errors and regex_errors and repair_count < 2:
                     repair_context = {
                         "source_header": context["current_header"],
                         "sample_values": values[:5],
+                        "required_header_parts": payload["new_headers"],
                         "regex": payload["regex"],
                         "errors": errors,
                         "actual": actual,
@@ -581,26 +594,31 @@ class TableFixerPipeline:
                     repair_count += 1
                     repaired_parsed = repaired.parsed or {}
                     payload["regex"] = repaired_parsed.get("regex", payload["regex"])
-                    payload["new_headers"] = repaired_parsed.get("new_headers", payload["new_headers"])
-                    compiled, errors, actual = validate_split_regex(
+                    compiled, regex_errors, actual = validate_split_regex(
                         context["current_header"],
                         payload["regex"],
                         payload["new_headers"],
                         values,
                         payload["expected"],
                     )
-                if errors:
-                    inferred = infer_whitespace_split(context["current_header"], values)
+                    errors = list(regex_errors)
+                if not header_errors and regex_errors:
+                    inferred = infer_whitespace_split(
+                        context["current_header"],
+                        values,
+                        require_header_parts=True,
+                    )
                     if inferred:
                         payload["regex"], payload["new_headers"] = inferred
                         payload["expected"] = {}
-                        compiled, errors, actual = validate_split_regex(
+                        compiled, regex_errors, actual = validate_split_regex(
                             context["current_header"],
                             payload["regex"],
                             payload["new_headers"],
                             values,
                             {},
                         )
+                        errors = list(regex_errors)
             valid = not errors and (not auto_apply or confidence >= self.structural_auto_apply_threshold)
             record = decision(
                 "columns",
@@ -761,7 +779,11 @@ class TableFixerPipeline:
         responses: list[StructuredResponse] = []
         row_issues: dict[str, list[IssueState]] = {}
         for issue in snapshot.issues.values():
-            if issue.status != "active" or issue.issue_type == "possible_merged_column":
+            if (
+                issue.status != "active"
+                or issue.issue_type == "possible_merged_column"
+                or is_ocr_confidence_issue(issue)
+            ):
                 continue
             for cell_id in issue.affected_cell_ids:
                 if cell_id in snapshot.cells:
@@ -857,12 +879,21 @@ class TableFixerPipeline:
             response = self._call("warnings", f"row_repair:{row_id}", context, ROW_REPAIR_SCHEMA)
             responses.append(response)
             record = build_record(response)
-            if not record.valid and record.action == "redistribute_row":
+            should_retry = (
+                not record.valid
+                and (
+                    record.action == "redistribute_row"
+                    or (record.action == "no_issue" and bool(record.payload.get("assignments")))
+                )
+            )
+            if should_retry:
                 retry_context = {
                     **context,
                     "retry_instruction": (
-                        "Return corrected final_values only. Include each listed header at most once and omit empty "
-                        "values. Split merged text instead of copying it unchanged. Never duplicate or invent text."
+                        "Return a consistent binary decision and corrected final_values. Set needs_correction=true "
+                        "when final_values changes any repair entry. Set needs_correction=false only with empty "
+                        "final_values and no change. Include each listed header at most once, omit empty values, and "
+                        "never duplicate, omit, or invent text."
                     ),
                     "previous_final_values": (response.parsed or {}).get(
                         "final_values",
