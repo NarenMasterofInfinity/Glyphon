@@ -11,11 +11,14 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+import fitz
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
-from parser import parse_pdf_pages
+from parser import parse_pdf_pages as parse_ocr_pdf_pages
+from text_parser import parse_pdf_pages as parse_text_pdf_pages
+from table_fixer.context import ensure_profiles
 from table_fixer.models import (
     CellState,
     DecisionRecord,
@@ -34,6 +37,7 @@ from table_fixer.workspace import (
     persist_event,
     persist_llm_trace,
     persist_parser_results,
+    persist_source_pdf,
     persist_phase_run,
     persist_snapshot,
     write_json,
@@ -41,6 +45,7 @@ from table_fixer.workspace import (
 
 
 PHASES = ["reconciliation", "metadata", "headers", "columns", "warnings"]
+EXTRACTION_MODES = ["text", "auto", "ocr"]
 DEFAULT_MODEL = "gemma3:4b"
 DEFAULT_BASE_URL = "http://localhost:11434"
 DEFAULT_CONTEXT_TOKEN_BUDGET = 3500
@@ -75,6 +80,12 @@ class ReviewDecisionRequest(BaseModel):
     decision: Literal["accept", "reject"]
 
 
+class ManualActionRequest(BaseModel):
+    base_phase: str = "source"
+    actions: list[dict[str, Any]] = Field(min_length=1)
+    note: str | None = None
+
+
 class WorkspaceResponse(BaseModel):
     workspace_id: str
     status: dict[str, Any]
@@ -92,6 +103,10 @@ def new_api_state() -> dict[str, Any]:
         "schema_version": "glyphon-table-fixer-api-state-v1",
         "accepted_labels": {"source": "source"},
         "pending_preview": None,
+        "invalidated_phases": [],
+        "manual_sequence": 0,
+        "manual_history": [],
+        "redo_stack": [],
     }
 
 
@@ -101,7 +116,16 @@ def load_api_state(workspace: Path) -> dict[str, Any]:
         state = new_api_state()
         write_json(path, state)
         return state
-    return json.loads(path.read_text(encoding="utf-8"))
+    state = json.loads(path.read_text(encoding="utf-8"))
+    defaults = new_api_state()
+    changed = False
+    for key, value in defaults.items():
+        if key not in state:
+            state[key] = value
+            changed = True
+    if changed:
+        write_json(path, state)
+    return state
 
 
 def save_api_state(workspace: Path, state: dict[str, Any]) -> None:
@@ -258,6 +282,46 @@ def parse_optional_list(raw_value: str | None, *, item_type: type[int] | type[st
     return [item_type(part.strip()) for part in stripped.split(",") if part.strip()]
 
 
+def page_has_native_text(pdf_bytes: bytes, page_number: int) -> bool:
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        if page_number < 1 or page_number > len(doc):
+            return False
+        page = doc[page_number - 1]
+        return any(str(word[4]).strip() for word in page.get_text("words", sort=True))
+    finally:
+        doc.close()
+
+
+def parse_pdf_pages_by_mode(
+    pdf_bytes: bytes,
+    *,
+    extraction_mode: str,
+    page_numbers: list[int] | None,
+):
+    if extraction_mode not in EXTRACTION_MODES:
+        raise HTTPException(status_code=400, detail=f"Unknown extraction mode: {extraction_mode}")
+    if extraction_mode == "text":
+        return parse_text_pdf_pages(pdf_bytes, page_numbers=page_numbers)
+    if extraction_mode == "ocr":
+        return parse_ocr_pdf_pages(pdf_bytes, page_numbers=page_numbers)
+
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        target_pages = page_numbers or list(range(1, len(doc) + 1))
+    finally:
+        doc.close()
+
+    text_pages = [page for page in target_pages if page_has_native_text(pdf_bytes, page)]
+    ocr_pages = [page for page in target_pages if page not in text_pages]
+    results = []
+    if text_pages:
+        results.extend(parse_text_pdf_pages(pdf_bytes, page_numbers=text_pages))
+    if ocr_pages:
+        results.extend(parse_ocr_pdf_pages(pdf_bytes, page_numbers=ocr_pages))
+    return sorted(results, key=lambda page: page.page_number)
+
+
 def validate_execute_request(request: ExecutePhasesRequest) -> None:
     if not request.phases:
         raise HTTPException(status_code=400, detail="At least one phase must be requested.")
@@ -268,6 +332,23 @@ def validate_execute_request(request: ExecutePhasesRequest) -> None:
         raise HTTPException(status_code=400, detail="Duplicate phases are not allowed.")
     if request.execution_mode == "preview" and len(request.phases) != 1:
         raise HTTPException(status_code=400, detail="Preview mode supports exactly one phase at a time.")
+
+
+def validate_phase_or_source(phase: str) -> None:
+    if phase != "source" and phase not in PHASES:
+        raise HTTPException(status_code=404, detail=f"Unknown phase: {phase}")
+
+
+def phase_and_later(phase: str) -> list[str]:
+    if phase == "source":
+        return list(PHASES)
+    return PHASES[PHASES.index(phase):]
+
+
+def phases_after(phase: str) -> list[str]:
+    if phase == "source":
+        return list(PHASES)
+    return PHASES[PHASES.index(phase) + 1:]
 
 
 def accepted_phases_from_state(state: dict[str, Any]) -> list[str]:
@@ -313,12 +394,28 @@ def validate_requested_phases(state: dict[str, Any], phases: list[str]) -> None:
 
 
 def invalidate_from_phase(state: dict[str, Any], phase: str) -> None:
-    start = PHASES.index(phase)
-    for later in PHASES[start:]:
+    for later in phase_and_later(phase):
         state["accepted_labels"].pop(later, None)
         pending = state.get("pending_preview")
         if pending and pending.get("phase") == later:
             state["pending_preview"] = None
+
+
+def invalidate_after_base_phase(state: dict[str, Any], phase: str) -> list[str]:
+    invalidated = phases_after(phase)
+    for later in invalidated:
+        state["accepted_labels"].pop(later, None)
+        pending = state.get("pending_preview")
+        if pending and pending.get("phase") == later:
+            state["pending_preview"] = None
+    state["invalidated_phases"] = invalidated
+    return invalidated
+
+
+def mark_phase_fresh(state: dict[str, Any], phase: str) -> None:
+    state["invalidated_phases"] = [
+        item for item in state.get("invalidated_phases", []) if item != phase
+    ]
 
 
 def build_pipeline(settings: ExecutionSettings) -> TableFixerPipeline:
@@ -369,6 +466,7 @@ def run_phase(
         persist_phase_run(workspace, phase, run, "auto_applied")
         state["accepted_labels"][phase] = f"{phase}_auto_applied"
         state["pending_preview"] = None
+        mark_phase_fresh(state, phase)
     return run, summarize_phase_run(run, execution_mode)
 
 
@@ -520,6 +618,151 @@ def summarize_snapshot(snapshot: PipelineSnapshot) -> dict[str, Any]:
     }
 
 
+def find_cell(snapshot: PipelineSnapshot, cell_id: str) -> CellState:
+    if cell_id not in snapshot.cells:
+        raise HTTPException(status_code=400, detail=f"Cell not found: {cell_id}")
+    return snapshot.cells[cell_id]
+
+
+def apply_manual_action(snapshot: PipelineSnapshot, action: dict[str, Any]) -> dict[str, Any]:
+    action_type = action.get("type") or action.get("action")
+    if not isinstance(action_type, str):
+        raise HTTPException(status_code=400, detail="Manual action requires a string type.")
+
+    if action_type == "edit_cell_text":
+        cell = find_cell(snapshot, str(action.get("cell_id", "")))
+        before = cell.text
+        cell.text = str(action.get("text", ""))
+        return {"type": action_type, "cell_id": cell.cell_id, "before": before, "after": cell.text}
+
+    if action_type == "set_warning_status":
+        issue_id = str(action.get("issue_id", ""))
+        if issue_id not in snapshot.issues:
+            raise HTTPException(status_code=400, detail=f"Issue not found: {issue_id}")
+        status = str(action.get("status", "active"))
+        if status not in {"active", "review", "resolved", "dismissed"}:
+            raise HTTPException(status_code=400, detail=f"Unsupported warning status: {status}")
+        issue = snapshot.issues[issue_id]
+        before = issue.status
+        issue.status = status
+        return {"type": action_type, "issue_id": issue_id, "before": before, "after": status}
+
+    if action_type == "move_cell":
+        source = find_cell(snapshot, str(action.get("source_cell_id", "")))
+        target = find_cell(snapshot, str(action.get("target_cell_id", "")))
+        source_before = source.text
+        target_before = target.text
+        mode = str(action.get("mode", "append"))
+        if mode == "replace":
+            target.text = source.text
+        else:
+            target.text = " ".join(value for value in [target.text.strip(), source.text.strip()] if value)
+        source.text = ""
+        return {
+            "type": action_type,
+            "source_cell_id": source.cell_id,
+            "target_cell_id": target.cell_id,
+            "source_before": source_before,
+            "target_before": target_before,
+            "source_after": source.text,
+            "target_after": target.text,
+        }
+
+    if action_type == "split_cell_text":
+        source = find_cell(snapshot, str(action.get("cell_id", "")))
+        assignments = action.get("assignments", [])
+        if not isinstance(assignments, list) or not assignments:
+            raise HTTPException(status_code=400, detail="split_cell_text requires assignments.")
+        changes = []
+        for assignment in assignments:
+            if not isinstance(assignment, dict):
+                raise HTTPException(status_code=400, detail="Each split assignment must be an object.")
+            target = find_cell(snapshot, str(assignment.get("cell_id", "")))
+            before = target.text
+            target.text = str(assignment.get("text", ""))
+            changes.append({"cell_id": target.cell_id, "before": before, "after": target.text})
+        return {"type": action_type, "source_cell_id": source.cell_id, "changes": changes}
+
+    if action_type == "merge_adjacent_cells":
+        cell_ids = [str(value) for value in action.get("cell_ids", [])]
+        if len(cell_ids) < 2:
+            raise HTTPException(status_code=400, detail="merge_adjacent_cells requires at least two cell_ids.")
+        cells = [find_cell(snapshot, cell_id) for cell_id in cell_ids]
+        target = find_cell(snapshot, str(action.get("target_cell_id") or cell_ids[0]))
+        before = {cell.cell_id: cell.text for cell in cells}
+        target.text = " ".join(cell.text.strip() for cell in cells if cell.text.strip())
+        for cell in cells:
+            if cell.cell_id != target.cell_id:
+                cell.text = ""
+        return {
+            "type": action_type,
+            "target_cell_id": target.cell_id,
+            "before": before,
+            "after": {cell.cell_id: cell.text for cell in cells},
+        }
+
+    if action_type == "set_decision_enabled":
+        decision_id = str(action.get("decision_id", ""))
+        enabled = bool(action.get("enabled", True))
+        for record in snapshot.decisions:
+            if record.decision_id == decision_id:
+                before = record.payload.get("manual_enabled", True)
+                record.payload["manual_enabled"] = enabled
+                record.payload["manual_note"] = action.get("note", "")
+                return {"type": action_type, "decision_id": decision_id, "before": before, "after": enabled}
+        raise HTTPException(status_code=400, detail=f"Decision not found: {decision_id}")
+
+    raise HTTPException(status_code=400, detail=f"Unsupported manual action type: {action_type}")
+
+
+def apply_manual_actions(
+    workspace: Path,
+    state: dict[str, Any],
+    request: ManualActionRequest,
+) -> dict[str, Any]:
+    validate_phase_or_source(request.base_phase)
+    if request.base_phase not in state["accepted_labels"]:
+        raise HTTPException(status_code=409, detail=f"Phase is not accepted: {request.base_phase}")
+
+    before_labels = dict(state["accepted_labels"])
+    source = load_snapshot(workspace, state["accepted_labels"][request.base_phase])
+    manual = source.clone(
+        f"snapshot_{request.base_phase}_manual_{state.get('manual_sequence', 0) + 1}",
+        request.base_phase,
+    )
+    summaries = [apply_manual_action(manual, action) for action in request.actions]
+    ensure_profiles(manual)
+    state["manual_sequence"] = int(state.get("manual_sequence", 0)) + 1
+    label = f"{request.base_phase}_manual_{state['manual_sequence']}"
+    persist_snapshot(workspace, label, manual)
+    state["accepted_labels"][request.base_phase] = label
+    invalidated = invalidate_after_base_phase(state, request.base_phase)
+    state["redo_stack"] = []
+    history_entry = {
+        "sequence": state["manual_sequence"],
+        "base_phase": request.base_phase,
+        "label": label,
+        "note": request.note,
+        "actions": request.actions,
+        "summaries": summaries,
+        "invalidated_phases": invalidated,
+        "before_accepted_labels": before_labels,
+        "after_accepted_labels": dict(state["accepted_labels"]),
+    }
+    state.setdefault("manual_history", []).append(history_entry)
+    return history_entry
+
+
+def restore_manual_history_state(state: dict[str, Any], entry: dict[str, Any], labels_key: str) -> None:
+    state["accepted_labels"] = dict(entry[labels_key])
+    state["pending_preview"] = None
+    base_phase = entry["base_phase"]
+    invalidated = phases_after(base_phase)
+    for phase in invalidated:
+        state["accepted_labels"].pop(phase, None)
+    state["invalidated_phases"] = invalidated
+
+
 def workspace_status(workspace: Path, state: dict[str, Any]) -> dict[str, Any]:
     manifest = json.loads((workspace / "manifest.json").read_text(encoding="utf-8"))
     accepted_phases = accepted_phases_from_state(state)
@@ -529,10 +772,15 @@ def workspace_status(workspace: Path, state: dict[str, Any]) -> dict[str, Any]:
         "source_file": manifest["source_file"],
         "file_key": manifest["file_key"],
         "page_numbers": manifest["page_numbers"],
+        "extraction_mode": manifest.get("extraction_mode", "ocr"),
         "accepted_phases": accepted_phases,
         "latest_accepted_phase": latest_accepted_phase(state),
         "next_available_phases": available_next_phases(state),
         "pending_review_phase": state.get("pending_preview", {}).get("phase") if state.get("pending_preview") else None,
+        "invalidated_phases": state.get("invalidated_phases", []),
+        "has_manual_changes": bool(state.get("manual_history")),
+        "manual_history_count": len(state.get("manual_history", [])),
+        "redo_count": len(state.get("redo_stack", [])),
     }
 
 
@@ -584,6 +832,7 @@ async def create_table_fixer_workspace(
     page_numbers: str | None = Form(default=None),
     phases: str | None = Form(default=None),
     execution_mode: Literal["preview", "auto_apply"] = Form(default="auto_apply"),
+    extraction_mode: Literal["text", "auto", "ocr"] = Form(default="ocr"),
     model: str = Form(default=DEFAULT_MODEL),
     base_url: str = Form(default=DEFAULT_BASE_URL),
     context_token_budget: int = Form(default=DEFAULT_CONTEXT_TOKEN_BUDGET),
@@ -608,9 +857,14 @@ async def create_table_fixer_workspace(
     ) if requested_phases else None
 
     file_key = sha256(pdf_bytes).hexdigest()
-    page_results = parse_pdf_pages(pdf_bytes, page_numbers=requested_pages or None)
+    page_results = parse_pdf_pages_by_mode(
+        pdf_bytes,
+        extraction_mode=extraction_mode,
+        page_numbers=requested_pages or None,
+    )
     page_scope = requested_pages or [page.page_number for page in page_results]
-    workspace = create_workspace(file.filename or "uploaded.pdf", file_key, page_scope)
+    workspace = create_workspace(file.filename or "uploaded.pdf", file_key, page_scope, extraction_mode)
+    persist_source_pdf(workspace, pdf_bytes)
     persist_parser_results(workspace, page_results)
     source = snapshot_from_parser(page_results)
     persist_snapshot(workspace, "source", source)
@@ -635,6 +889,40 @@ def get_table_fixer_workspace(workspace_id: str) -> WorkspaceResponse:
     workspace = resolve_workspace(workspace_id)
     state = load_api_state(workspace)
     return build_workspace_response(workspace, state)
+
+
+@app.get("/table-fixer/workspaces/{workspace_id}/snapshots/{phase}")
+def get_table_fixer_snapshot(workspace_id: str, phase: str) -> dict[str, Any]:
+    validate_phase_or_source(phase)
+    workspace = resolve_workspace(workspace_id)
+    state = load_api_state(workspace)
+    label = state["accepted_labels"].get(phase)
+    if not label:
+        raise HTTPException(status_code=409, detail=f"Phase is not accepted: {phase}")
+    return summarize_snapshot(load_snapshot(workspace, label))
+
+
+@app.get("/table-fixer/workspaces/{workspace_id}/pages/{page_number}/image")
+def get_table_fixer_page_image(
+    workspace_id: str,
+    page_number: int,
+    zoom: float = 2.0,
+) -> Response:
+    workspace = resolve_workspace(workspace_id)
+    pdf_path = workspace / "source.pdf"
+    if not pdf_path.exists():
+        raise HTTPException(status_code=404, detail="Workspace source PDF is not available.")
+    if zoom <= 0 or zoom > 6:
+        raise HTTPException(status_code=400, detail="zoom must be > 0 and <= 6.")
+    doc = fitz.open(str(pdf_path))
+    try:
+        if page_number < 1 or page_number > len(doc):
+            raise HTTPException(status_code=404, detail=f"Page not found: {page_number}")
+        page = doc[page_number - 1]
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        return Response(content=pix.tobytes("png"), media_type="image/png")
+    finally:
+        doc.close()
 
 
 @app.post("/table-fixer/workspaces/{workspace_id}/execute", response_model=WorkspaceResponse)
@@ -665,11 +953,52 @@ def review_table_fixer_phase(workspace_id: str, phase: str, request: ReviewDecis
     if request.decision == "accept":
         state["accepted_labels"][phase] = pending["label"]
         state["pending_preview"] = None
+        mark_phase_fresh(state, phase)
         save_api_state(workspace, state)
     else:
         persist_event(workspace, phase, "rejected")
         state["pending_preview"] = None
         save_api_state(workspace, state)
+    return build_workspace_response(workspace, state)
+
+
+@app.post("/table-fixer/workspaces/{workspace_id}/manual-actions", response_model=WorkspaceResponse)
+def apply_table_fixer_manual_actions(
+    workspace_id: str,
+    request: ManualActionRequest,
+) -> WorkspaceResponse:
+    workspace = resolve_workspace(workspace_id)
+    state = load_api_state(workspace)
+    apply_manual_actions(workspace, state, request)
+    save_api_state(workspace, state)
+    return build_workspace_response(workspace, state)
+
+
+@app.post("/table-fixer/workspaces/{workspace_id}/history/undo", response_model=WorkspaceResponse)
+def undo_table_fixer_manual_action(workspace_id: str) -> WorkspaceResponse:
+    workspace = resolve_workspace(workspace_id)
+    state = load_api_state(workspace)
+    history = state.setdefault("manual_history", [])
+    if not history:
+        raise HTTPException(status_code=409, detail="No manual actions are available to undo.")
+    entry = history.pop()
+    state.setdefault("redo_stack", []).append(entry)
+    restore_manual_history_state(state, entry, "before_accepted_labels")
+    save_api_state(workspace, state)
+    return build_workspace_response(workspace, state)
+
+
+@app.post("/table-fixer/workspaces/{workspace_id}/history/redo", response_model=WorkspaceResponse)
+def redo_table_fixer_manual_action(workspace_id: str) -> WorkspaceResponse:
+    workspace = resolve_workspace(workspace_id)
+    state = load_api_state(workspace)
+    redo_stack = state.setdefault("redo_stack", [])
+    if not redo_stack:
+        raise HTTPException(status_code=409, detail="No manual actions are available to redo.")
+    entry = redo_stack.pop()
+    state.setdefault("manual_history", []).append(entry)
+    restore_manual_history_state(state, entry, "after_accepted_labels")
+    save_api_state(workspace, state)
     return build_workspace_response(workspace, state)
 
 

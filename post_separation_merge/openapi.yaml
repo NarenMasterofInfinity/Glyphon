@@ -1,0 +1,170 @@
+openapi: 3.1.0
+info:
+  title: Glyphon Post-Separation Merge API
+  version: unversioned
+  description: Decides which page-level table fragments belong to the same logical table.
+servers:
+  - url: http://localhost:8780
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: health
+      responses:
+        '200':
+          description: Service health
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /merge-decisions:
+    post:
+      summary: Decide which table fragments should merge
+      description: |
+        Evaluates only consecutive-page boundaries: a table at the end of page N
+        against a table at the start of page N+1. Identical normalized headers merge
+        deterministically. Other same-width candidates use the LLM unless llm is false.
+      operationId: mergeDecisions
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergeRequest'
+      responses:
+        '200':
+          description: Pair decisions and final merge groups
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MergeResponse'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '502':
+          $ref: '#/components/responses/ErrorResponse'
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          const: ok
+        service:
+          type: string
+          const: glyphon-post-separation-merge
+      required: [status, service]
+    TableFragment:
+      type: object
+      description: A table extracted from one page. Supply only a few representative data rows.
+      properties:
+        table_id:
+          type: string
+          minLength: 1
+        page_number:
+          type: integer
+          minimum: 1
+        table_index:
+          type: integer
+          minimum: 1
+          description: 1-based reading-order position of this table on its page.
+        is_page_start:
+          type: boolean
+          description: Whether this fragment begins at the top table boundary of its page.
+        is_page_end:
+          type: boolean
+          description: Whether this fragment ends at the bottom table boundary of its page.
+        header:
+          type: array
+          minItems: 1
+          items:
+            type: string
+        sample_rows:
+          type: array
+          maxItems: 10
+          description: Last few rows for an end fragment or first few rows for a start fragment.
+          items:
+            type: array
+            items:
+              type: string
+      required: [table_id, page_number, table_index, is_page_start, is_page_end, header]
+    MergeRequest:
+      type: object
+      properties:
+        tables:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/TableFragment'
+        llm:
+          type: boolean
+          default: true
+          description: When false, differing headers are not sent to Ollama.
+        model:
+          type: string
+          default: gemma3:4b
+        base_url:
+          type: string
+          default: http://localhost:11434
+      required: [tables]
+    PairDecision:
+      type: object
+      properties:
+        left_table_id:
+          type: string
+        right_table_id:
+          type: string
+        merge:
+          type: boolean
+        method:
+          type: string
+          enum: [deterministic, llm, llm_disabled, incompatible]
+        confidence:
+          type: number
+          minimum: 0
+          maximum: 1
+        reason:
+          type: string
+        proposed_header:
+          type: [array, 'null']
+          items:
+            type: string
+      required: [left_table_id, right_table_id, merge, method, confidence, reason]
+    MergeGroup:
+      type: object
+      properties:
+        table_ids:
+          type: array
+          items:
+            type: string
+        proposed_header:
+          type: array
+          items:
+            type: string
+      required: [table_ids, proposed_header]
+    MergeResponse:
+      type: object
+      properties:
+        decisions:
+          type: array
+          items:
+            $ref: '#/components/schemas/PairDecision'
+        merge_groups:
+          type: array
+          description: Ordered logical tables. Groups with multiple IDs should be merged.
+          items:
+            $ref: '#/components/schemas/MergeGroup'
+      required: [decisions, merge_groups]
+  responses:
+    ErrorResponse:
+      description: Error response
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              detail:
+                type: string
+            required: [detail]

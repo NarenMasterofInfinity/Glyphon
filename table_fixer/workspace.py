@@ -14,7 +14,12 @@ from .pipeline import PhaseRun
 WORKSPACES_ROOT = Path(__file__).resolve().parent / "workspaces"
 
 
-def create_workspace(file_name: str, file_key: str, page_numbers: list[int]) -> Path:
+def create_workspace(
+    file_name: str,
+    file_key: str,
+    page_numbers: list[int],
+    extraction_mode: str = "ocr",
+) -> Path:
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     workspace = WORKSPACES_ROOT / f"{timestamp}_{file_key[:10]}"
     suffix = 1
@@ -30,9 +35,14 @@ def create_workspace(file_name: str, file_key: str, page_numbers: list[int]) -> 
             "source_file": file_name,
             "file_key": file_key,
             "page_numbers": page_numbers,
+            "extraction_mode": extraction_mode,
         },
     )
     return workspace
+
+
+def persist_source_pdf(workspace: Path, pdf_bytes: bytes) -> None:
+    (workspace / "source.pdf").write_bytes(pdf_bytes)
 
 
 def persist_snapshot(workspace: Path, label: str, snapshot: PipelineSnapshot) -> None:
